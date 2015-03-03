@@ -448,7 +448,7 @@ void update_stats(struct rte_timer *tim, void *arg)
 
     uint64_t tx_pps = (ctx->total_tx_packets - ctx->last_total_tx_packets) / (usec_diff / 1e6);
     uint64_t tx_bps = ((ctx->total_tx_bytes - ctx->last_total_tx_bytes) * 8) / (usec_diff / 1e6);
-    printf("CPU %d: %8ld pps, %6.3f Gbps "
+    printf("CPU %d: %'10ld pps, %6.3f Gbps "
             "(%.2f packets per batch)",
             ctx->my_cpu,
             tx_pps,
@@ -478,7 +478,7 @@ void update_stats(struct rte_timer *tim, void *arg)
 
         tx_pps = ctx->tx_packets[port_idx];
         tx_bps = ctx->tx_bytes[port_idx] * 8;
-        printf("  %s.%d:%8ld pps,%6.3f Gbps",
+        printf("  %s.%d: %'10ld pps,%6.3f Gbps",
                 driver, port_idx, tx_pps, (tx_bps + (tx_pps * 24) * 8) / 1000000000.0);
     }
     printf("\n");
@@ -701,7 +701,6 @@ int send_packets(void *arg)
 
     struct rte_timer *stat_timer = rte_zmalloc("timer", sizeof(struct rte_timer), RTE_CACHE_LINE_SIZE);
     assert(stat_timer != NULL);
-    memset(stat_timer, 0, sizeof(struct rte_timer));
     rte_timer_init(stat_timer);
     rte_timer_reset(stat_timer, rte_get_timer_hz() * 1, PERIODICAL, ctx->my_cpu, update_stats, (void *) ctx);
 
@@ -1236,8 +1235,8 @@ int main(int argc, char **argv)
 
     unsigned num_rxq_per_port = num_cpus / numa_num_configured_nodes();
     unsigned num_txq_per_port = num_cpus / numa_num_configured_nodes();
-    unsigned num_rx_desc = 1024;
-    unsigned num_tx_desc = 1024;
+    unsigned num_rx_desc = 512;
+    unsigned num_tx_desc = 512;
 
     struct rte_eth_conf port_conf;
     memset(&port_conf, 0, sizeof(port_conf));
