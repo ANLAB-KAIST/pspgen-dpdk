@@ -15,7 +15,9 @@ export PSPGEN_PMD=ixgbe
 make
 sudo ./pspgen -cff -n3 -- -i all -f 0 -v 4 -p 64
 ```
-Differently from the psio version, it takes two disjoin set of arguments: one set for DPDK EAL and the other set for pspgen itself.
+Differently from the psio version, it takes two disjoin sets of arguments: one set for DPDK EAL and the other set for pspgen itself, separated by `--`.
+To see detailed arguments, just run `sudo ./pspgen`.
+Depending on your system configuration (`/dev/uioX` and hugepage permissions), you may not need `sudo`.
 Change the EAL arguments according to your system configuration.
 
-Another difference is that the device names are no long `xge#` but `rte_ixgbe_pmd.#` (a string composed of DPDK driver name, dot, and the enumeration index) instead because DPDK-managed interfaces does not have host-bound interface names.
+Another difference is that the device names are no longer `xge#` but `rte_ixgbe_pmd.#` (a string composed of DPDK driver name, dot, and the enumeration index) instead because DPDK-managed interfaces does not have host-bound interface names.
