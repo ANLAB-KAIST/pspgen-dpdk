@@ -189,10 +189,9 @@ pcap_pkt_info_t *pcap_pkt_info_arr;
 long    pkt_info_arr_index;
 /* pcap_replaying: end */
 
-static rte_spinlock_t _ht_func_lock = RTE_SPINLOCK_INITIALIZER;
-
 static int ps_num_hyperthreading_siblings(void) {
     // TODO: make it portable
+    static rte_spinlock_t _ht_func_lock = RTE_SPINLOCK_INITIALIZER;
     static int memoized_result = -1;
     rte_spinlock_lock(&_ht_func_lock);
     if (memoized_result == -1) {
@@ -222,10 +221,6 @@ static int ps_bind_cpu(int cpu) {
     struct bitmask *bmask;
     size_t ncpus = ps_get_num_cpus();
 
-    /* skip NUMA stuff for UMA systems */
-    if (numa_available() == -1 || numa_max_node() == 0)
-        return 0;
-
     bmask = numa_bitmask_alloc(ncpus);
     assert(bmask != NULL);
     assert(cpu >= 0 && cpu < ncpus);
@@ -233,6 +228,10 @@ static int ps_bind_cpu(int cpu) {
     numa_bitmask_setbit(bmask, cpu);
     numa_sched_setaffinity(0, bmask);
     numa_bitmask_free(bmask);
+
+    /* skip NUMA stuff for UMA systems */
+    if (numa_available() == -1 || numa_max_node() == 0)
+        return 0;
 
     bmask = numa_bitmask_alloc(numa_num_configured_nodes());
     assert(bmask != NULL);
@@ -869,7 +868,7 @@ int send_packets(void *arg)
     usleep(10000 * (ctx->my_cpu + 1));
 
     printf("----------\n");
-    printf("CPU %d: total %ld packets transmitted\n",
+    printf("CPU %d: total %'ld packets transmitted\n",
             ctx->my_cpu, ctx->total_tx_packets);
     if (ctx->mode == TRACE_REPLAY) {
         printf("CPU %d: total %ld packets not transmitted due to TX drop\n",
