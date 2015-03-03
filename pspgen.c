@@ -1373,7 +1373,7 @@ int main(int argc, char **argv)
         ctx->num_attached_ports = 0;
         for (int i = 0; i < num_devices_registered; i++) {
             int port_idx = devices_registered[i];
-            if (!ps_in_samenode(ctx->my_cpu, port_idx)) {
+            if (ps_in_samenode(ctx->my_cpu, port_idx)) {
                 ctx->attached_ports[ctx->num_attached_ports ++] = port_idx;
                 printf("  core %d (node %d) uses port:ring %d:%d\n", my_cpu, node_id, port_idx, ctx->ring_idx);
                 ctx->tx_mempools[port_idx] = tx_mempools[port_idx][ctx->ring_idx];
