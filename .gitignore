@@ -23,3 +23,4 @@ pspgen
 
 # Miscellaneous
 neighbors.conf
+*.log

@@ -87,6 +87,8 @@ struct pspgen_context {
     uint64_t cnt_latency;
 
     bool latency_measure;
+    bool latency_record;
+    char latency_record_prefix[MAX_PATH];
     int latency_offset;
     uint32_t magic_number;
 
@@ -445,30 +447,30 @@ void update_stats(struct rte_timer *tim, void *arg)
         ctx->total_rx_bytes += ctx->rx_bytes[port_idx];
     }
 
-    uint64_t tx_pps = (ctx->total_tx_packets - ctx->last_total_tx_packets) / (usec_diff / 1e6);
-    uint64_t tx_bps = ((ctx->total_tx_bytes - ctx->last_total_tx_bytes) * 8) / (usec_diff / 1e6);
+    uint64_t tx_pps = (ctx->total_tx_packets - ctx->last_total_tx_packets) / (usec_diff / 1e6f);
+    uint64_t tx_bps = ((ctx->total_tx_bytes - ctx->last_total_tx_bytes) * 8) / (usec_diff / 1e6f);
     printf("CPU %d: %'10ld pps, %6.3f Gbps "
             "(%.2f packets per batch)",
             ctx->my_cpu,
             tx_pps,
-            (tx_bps + (tx_pps * 24) * 8) / 1000000000.0,
+            (tx_bps + (tx_pps * 24) * 8) / 1e9f,
             (float) (ctx->total_tx_packets - ctx->last_total_tx_packets)
                     / (ctx->total_tx_batches - ctx->last_total_tx_batches));
 
     if (ctx->latency_measure && ctx->cnt_latency > 0) {
         printf(" %9.2f us %7lu",
-               ((ctx->accum_latency / ctx->cnt_latency) / (ctx->tsc_hz / 1000000.0)),
+               ((ctx->accum_latency / ctx->cnt_latency) / (ctx->tsc_hz / 1e6f)),
                ctx->cnt_latency);
-        if (ctx->latency_log) {
+        if (ctx->latency_record && ctx->latency_log != NULL) {
             fprintf(ctx->latency_log, "-----------\n");
             for (int j = 0; j < MAX_LATENCY; j++) {
                 fprintf(ctx->latency_log, "%u %lu\n", j, ctx->latency_buckets[j]);
             }
             fflush(ctx->latency_log);
+            memset(ctx->latency_buckets, 0, sizeof(uint64_t) * MAX_LATENCY);
         }
         ctx->accum_latency = 0;
         ctx->cnt_latency = 0;
-        memset(ctx->latency_buckets, 0, sizeof(uint64_t) * MAX_LATENCY);
     }
 
     for (int i = 0; i < ctx->num_attached_ports; i++) {
@@ -484,7 +486,7 @@ void update_stats(struct rte_timer *tim, void *arg)
     fflush(stdout);
 
     ctx->elapsed_sec ++;
-    if (ctx->elapsed_sec == ctx->time_limit)
+    if (ctx->time_limit > 0 && ctx->elapsed_sec >= ctx->time_limit)
         stop_all();
 
     for (int i = 0; i < ctx->num_attached_ports; i++) {
@@ -509,34 +511,6 @@ static inline uint32_t myrand(uint64_t *seed)
 {
     *seed = *seed * 1103515245 + 12345;
     return (uint32_t)(*seed >> 32);
-}
-
-#define RECV_BATCH_SIZE 512
-void receive_packets(struct pspgen_context *ctx)
-{
-    //chunk->cnt = RECV_BATCH_SIZE;
-    //chunk->recv_blocking = blocking;
-#if 0
-    while (1) {
-        //int ret = ps_recv_chunk(handle, chunk);
-        int ret = 0;
-
-        if (ret > 0) {
-            //char *ptr = chunk->buf + chunk->info[ret - 1].offset + ctx->latency_offset;
-            char *ptr = NULL;
-            if (*(uint32_t *)ptr == ctx->magic_number) {
-                uint64_t old_rdtsc = *(uint64_t *)(ptr + 4);
-                uint64_t latency = rte_get_tsc_cycles() - old_rdtsc;
-                ctx->cnt_latency++;
-                ctx->accum_latency += latency;
-                ctx->latency_buckets[(unsigned) (latency / (ctx->tsc_hz / 1000000.0))]++;
-            }
-        }
-
-        //chunk->cnt = RECV_BATCH_SIZE;
-        //chunk->recv_blocking = 0;
-    }
-#endif
 }
 
 void build_packet(char *buf, int size, bool randomize, uint64_t *seed)
@@ -744,10 +718,12 @@ int send_packets(void *arg)
 
     if (ctx->latency_measure) {
         char latency_log_name[MAX_PATH];
-        snprintf(latency_log_name, sizeof(latency_log_name), "latency-cpu%02d-%02d%02d%02d.%02d%02d%02d.log",
-             ctx->my_cpu, ctx->begin.tm_year, ctx->begin.tm_mon + 1, ctx->begin.tm_mday,
-             ctx->begin.tm_hour, ctx->begin.tm_min, ctx->begin.tm_sec);
-        ctx->latency_log = fopen(latency_log_name, "w");
+        if (ctx->latency_record) {
+            snprintf(latency_log_name, sizeof(latency_log_name), "latency-%s-cpu%02d-%02d%02d%02d.%02d%02d%02d.log",
+                     ctx->latency_record_prefix, ctx->my_cpu, ctx->begin.tm_year, ctx->begin.tm_mon + 1, ctx->begin.tm_mday,
+                     ctx->begin.tm_hour, ctx->begin.tm_min, ctx->begin.tm_sec);
+            ctx->latency_log = fopen(latency_log_name, "w");
+        }
     }
 
     rte_atomic16_init(&ctx->working);
@@ -855,7 +831,29 @@ int send_packets(void *arg)
         }
 
         if (ctx->latency_measure) {
-            receive_packets(ctx);
+            for (int i = 0; i < ctx->num_attached_ports; i++) {
+                uint8_t port_idx = (uint8_t) ctx->attached_ports[i];
+                struct rte_mbuf *pkts[ctx->batch_size];
+                unsigned recv_cnt = rte_eth_rx_burst(port_idx, ctx->ring_idx, &pkts[0], ctx->batch_size);
+
+                for (unsigned j = 0; j < recv_cnt; j++) {
+                    char *buf = rte_pktmbuf_mtod(pkts[j], char *);
+
+                    if (*(uint32_t *)buf == ctx->magic_number) {
+                        uint64_t old_rdtsc = *(uint64_t *)(buf + 4);
+                        uint64_t latency = rte_get_tsc_cycles() - old_rdtsc;
+                        ctx->cnt_latency ++;
+                        ctx->accum_latency += latency;
+                        ctx->latency_buckets[(unsigned) (latency / (ctx->tsc_hz / 1e6f))]++;
+                    }
+
+                    ctx->rx_bytes[port_idx] += rte_pktmbuf_pkt_len(pkts[j]);
+                    rte_pktmbuf_free(pkts[j]);
+                }
+
+                ctx->rx_packets[port_idx] += recv_cnt;
+                ctx->rx_batches[port_idx] += 1;
+            }
         }
 
         rte_timer_manage();
@@ -889,15 +887,18 @@ void print_usage(const char *program)
            "[-p <packet_size>] "
            "[--min-pkt-size <min_packet_size>] "
            "[-f <num_flows>] "
-           "[-r <randomize flows>] "
-           "[-v <ip version>] "
-           "[-l <latency measure>] "
-           "[-c <loop count>] "
+           "[-r <randomize_flows>] "
+           "[-v <ip_version>] "
+           "[-l <latency_measure>] "
+           "[--latency-record-prefix <prefix>] "
+           "[-c <loop_count>] "
            "[-t <seconds>] "
-           "[-g <offered throughput>] "
+           "[-g <offered_throughput>] "
            "[--debug] "
-           "[--neighbor-conf <neighbor config file>]\n",
+           "[--loglevel <debug|info|...|critical|emergency>] "
+           "[--neighbor-conf <neighbor_config_file>]\n",
            program);
+    // TODO: add latency record option
     printf("\nTo replay traces (currently only supports pcap):\n");
     printf("  %s -i all|dev1 [-i dev2] ... --trace <file_name> [--repeat] [--debug]\n\n", program);
 
@@ -911,12 +912,13 @@ void print_usage(const char *program)
            "    Must follow after <packet_size> option to be effective.\n");
     printf("  default <num_flows> is 0. (0 = infinite)\n");
     printf("  default <randomize_flows> is 1. (0 = off)\n");
-    printf("  default <ip version> is 4. (6 = ipv6)\n");
-    printf("  default <latency> is 0. (1 = on)\n");
-    printf("  default <loop count> is 1. (only valid for latency mesaurement)\n");
+    printf("  default <ip_version> is 4. (6 = ipv6)\n");
+    printf("  default <latency_measure> is 0. (1 = on)\n");
+    printf("  default <prefix> is none (don't record latency histogram into files).\n");
+    printf("  default <loop_count> is 1. (only valid for latency mesaurement)\n"); // TODO: re-implement
     printf("  default <seconds> is 0. (0 = infinite)\n");
-    printf("  default <offered throughput> is maximum possible. (Gbps including Ethernet overheads)\n");
-    printf("  default <neighbor config file> is ./neighbors.conf\n");
+    printf("  default <offered_throughput> is maximum possible. (Gbps including Ethernet overheads)\n");
+    printf("  default <neighbor_config_file> is ./neighbors.conf\n");
     exit(EXIT_FAILURE);
 }
 
@@ -926,19 +928,21 @@ int main(int argc, char **argv)
     int ret;
     int mode = UNSET;
 
-    int num_cpus = 0;
+    int num_cpus    = 0;
     int num_packets = 0;
-    int batch_size = 64;
+    int batch_size  = 64;
     int packet_size = 60;
     int min_packet_size = packet_size;
-    int loop_count = 1;
+    int loop_count  = 1;
     unsigned time_limit = 0;
 
-    int num_flows = 0;
+    int num_flows  = 0;
     int ip_version = 4;
     bool randomize_flows = true;
 
     bool latency_measure = false;
+    bool latency_record  = false;
+    char latency_record_prefix[MAX_PATH] = {0,};
     double offered_throughput = -1.0f;
 
     uint32_t magic_number = 0;
@@ -976,6 +980,7 @@ int main(int argc, char **argv)
         {"trace", required_argument, NULL, 0},
         {"debug", no_argument, NULL, 0},
         {"loglevel", required_argument, NULL, 0},
+        {"latency-record-prefix", required_argument, NULL, 0},
         {"min-pkt-size", required_argument, NULL, 0},
         {"neighbor-conf", required_argument, NULL, 0},
         {"help", no_argument, NULL, 'h'},
@@ -1023,6 +1028,10 @@ int main(int argc, char **argv)
                     loglevel = RTE_LOG_EMERG;
                 else
                     rte_exit(EXIT_FAILURE, "Invalid value for loglevel: %s\n", optarg);
+            } else if (!strcmp("latency-record-prefix", long_opts[optidx].name)) {
+                assert(optarg != NULL);
+                latency_record = true;
+                strncpy(latency_record_prefix, optarg, MAX_PATH);
             } else if (!strcmp("debug", long_opts[optidx].name)) {
                 debug = true;
             } else if (!strcmp("min-pkt-size", long_opts[optidx].name)) {
@@ -1213,6 +1222,9 @@ int main(int argc, char **argv)
     printf("randomize flows = %d\n", randomize_flows);
     printf("ip version = %d\n", ip_version);
     printf("latency measure = %d\n", latency_measure);
+    if (latency_record) {
+        printf("  recording histogram using prefix \"%s\"\n", latency_record_prefix);
+    }
     printf("loop count = %d\n", loop_count);
     printf("offered throughput = %.2f Gbps\n", offered_throughput);
     printf("time limit = %u\n", time_limit);
@@ -1387,8 +1399,13 @@ int main(int argc, char **argv)
         ctx->loop_count      = loop_count;
         ctx->begin           = begin_datetime;
 
+        ctx->time_limit      = time_limit;
+
         ctx->latency_measure = latency_measure;
-        ctx->magic_number    = magic_number;
+        ctx->latency_record  = latency_record;
+        ctx->latency_log     = NULL;  /* opened in send_packets() */
+        strncpy(ctx->latency_record_prefix, latency_record_prefix, MAX_PATH);
+        ctx->magic_number    = magic_number + my_cpu;
 
         used_cores_per_node[node_id] ++;
     }
