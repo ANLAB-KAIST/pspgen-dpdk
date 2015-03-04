@@ -823,10 +823,8 @@ int send_packets(void *arg)
             sent_cnt = rte_eth_tx_burst((uint8_t) port_idx, ctx->ring_idx, pkts, to_send);
             for (int j = 0; j < sent_cnt; j++)
                 sent_bytes += rte_pktmbuf_data_len(pkts[j]);
-            if (sent_cnt < ctx->batch_size) {
-                for (int j = sent_cnt; j < ctx->batch_size; j++)
-                    rte_pktmbuf_free(pkts[j]);
-            }
+            if (sent_cnt < to_send)
+                rte_mempool_sp_put_bulk(ctx->tx_mempools[port_idx], (void **) &pkts[sent_cnt], to_send - sent_cnt);
             ctx->tx_bytes[port_idx] += sent_bytes;
             if (ctx->offered_throughput > 0 && ctx->use_rate_limiter) {
                 update_rate(&ctx->rate_limiters[port_idx], (sent_cnt * ETH_EXTRA_BYTES + sent_bytes) * 8 / 1000.0);
@@ -868,7 +866,8 @@ skip_tx_packets:
                         uint64_t latency = timestamp - old_rdtsc;
                         ctx->cnt_latency ++;
                         ctx->accum_latency += latency;
-                        ctx->latency_buckets[(unsigned) (latency / (ctx->tsc_hz / 1e6f))]++;
+                        unsigned latency_us = (unsigned) (latency / (ctx->tsc_hz / 1e6f));
+                        ctx->latency_buckets[RTE_MIN((unsigned) MAX_LATENCY, latency_us)]++;
                     }
 
                     ctx->rx_bytes[port_idx] += rte_pktmbuf_pkt_len(pkts[j]);
