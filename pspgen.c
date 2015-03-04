@@ -450,24 +450,25 @@ void update_stats(struct rte_timer *tim, void *arg)
     uint64_t tx_pps = (ctx->total_tx_packets - ctx->last_total_tx_packets) / (usec_diff / 1e6f);
     uint64_t tx_bps = ((ctx->total_tx_bytes - ctx->last_total_tx_bytes) * 8) / (usec_diff / 1e6f);
     printf("CPU %d: %'10ld pps, %6.3f Gbps "
-            "(%.1f packets per batch)",
+            "(%.1f pkts/batch)",
             ctx->my_cpu,
             tx_pps,
-            (tx_bps + (tx_pps * 24) * 8) / 1e9f,
+            (tx_bps + (tx_pps * ETH_EXTRA_BYTES) * 8) / 1e9f,
             (float) (ctx->total_tx_packets - ctx->last_total_tx_packets)
                     / (ctx->total_tx_batches - ctx->last_total_tx_batches));
 
     if (ctx->latency_measure && ctx->cnt_latency > 0) {
-        printf(" %7.2f us (%'9lu samples)",
+        printf("  %7.2f us (%'9lu samples)",
                ((ctx->accum_latency / ctx->cnt_latency) / (ctx->tsc_hz / 1e6f)),
                ctx->cnt_latency);
         ctx->accum_latency = 0;
         ctx->cnt_latency = 0;
 
         if (ctx->latency_record && ctx->latency_log != NULL) {
-            fprintf(ctx->latency_log, "-----------\n");
+            fprintf(ctx->latency_log, "----- %lu sec -----\n", ctx->elapsed_sec);
             for (int j = 0; j < MAX_LATENCY; j++) {
-                fprintf(ctx->latency_log, "%u %lu\n", j, ctx->latency_buckets[j]);
+                if (ctx->latency_buckets[j] != 0)
+                    fprintf(ctx->latency_log, "%u %lu\n", j, ctx->latency_buckets[j]);
             }
             fflush(ctx->latency_log);
             memset(ctx->latency_buckets, 0, sizeof(uint64_t) * MAX_LATENCY);
@@ -481,7 +482,7 @@ void update_stats(struct rte_timer *tim, void *arg)
         tx_pps = ctx->tx_packets[port_idx];
         tx_bps = ctx->tx_bytes[port_idx] * 8;
         printf("  %s.%d: %'10ld pps,%6.3f Gbps",
-                driver, port_idx, tx_pps, (tx_bps + (tx_pps * 24) * 8) / 1000000000.0);
+                driver, port_idx, tx_pps, (tx_bps + (tx_pps * ETH_EXTRA_BYTES) * 8) / 1000000000.0);
     }
     printf("\n");
     fflush(stdout);
@@ -867,8 +868,8 @@ int send_packets(void *arg)
     usleep(10000 * (ctx->my_cpu + 1));
 
     printf("----------\n");
-    printf("CPU %d: total %'ld packets transmitted\n",
-            ctx->my_cpu, ctx->total_tx_packets);
+    printf("CPU %d: total %'lu packets, %'lu bytes transmitted\n",
+            ctx->my_cpu, ctx->total_tx_packets, ctx->total_tx_bytes);
     if (ctx->mode == TRACE_REPLAY) {
         printf("CPU %d: total %ld packets not transmitted due to TX drop\n",
                ctx->my_cpu, pcap_num_pkts_not_sent);   // pcap_replaying
