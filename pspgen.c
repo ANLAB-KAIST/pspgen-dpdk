@@ -450,7 +450,7 @@ void update_stats(struct rte_timer *tim, void *arg)
     uint64_t tx_pps = (ctx->total_tx_packets - ctx->last_total_tx_packets) / (usec_diff / 1e6f);
     uint64_t tx_bps = ((ctx->total_tx_bytes - ctx->last_total_tx_bytes) * 8) / (usec_diff / 1e6f);
     printf("CPU %d: %'10ld pps, %6.3f Gbps "
-            "(%.2f packets per batch)",
+            "(%.1f packets per batch)",
             ctx->my_cpu,
             tx_pps,
             (tx_bps + (tx_pps * 24) * 8) / 1e9f,
@@ -458,7 +458,7 @@ void update_stats(struct rte_timer *tim, void *arg)
                     / (ctx->total_tx_batches - ctx->last_total_tx_batches));
 
     if (ctx->latency_measure && ctx->cnt_latency > 0) {
-        printf(" %9.2f us %7lu",
+        printf(" %7.2f us (%'9lu samples)",
                ((ctx->accum_latency / ctx->cnt_latency) / (ctx->tsc_hz / 1e6f)),
                ctx->cnt_latency);
         ctx->accum_latency = 0;
