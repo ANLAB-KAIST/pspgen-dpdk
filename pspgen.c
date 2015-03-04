@@ -441,26 +441,25 @@ void update_stats(struct rte_timer *tim, void *arg)
         int port_idx = ctx->attached_ports[i];
         ctx->total_tx_packets += ctx->tx_packets[port_idx];
         ctx->total_tx_batches += ctx->tx_batches[port_idx];
-        ctx->total_tx_bytes += ctx->tx_bytes[port_idx];
+        ctx->total_tx_bytes   += ctx->tx_bytes[port_idx];
         ctx->total_rx_packets += ctx->rx_packets[port_idx];
         ctx->total_rx_batches += ctx->rx_batches[port_idx];
-        ctx->total_rx_bytes += ctx->rx_bytes[port_idx];
+        ctx->total_rx_bytes   += ctx->rx_bytes[port_idx];
     }
 
+    char linebuf[512];
+    int p = 0;
     uint64_t tx_pps = (ctx->total_tx_packets - ctx->last_total_tx_packets) / (usec_diff / 1e6f);
     uint64_t tx_bps = ((ctx->total_tx_bytes - ctx->last_total_tx_bytes) * 8) / (usec_diff / 1e6f);
-    printf("CPU %d: %'10ld pps, %6.3f Gbps "
-            "(%.1f pkts/batch)",
-            ctx->my_cpu,
-            tx_pps,
-            (tx_bps + (tx_pps * ETH_EXTRA_BYTES) * 8) / 1e9f,
-            (float) (ctx->total_tx_packets - ctx->last_total_tx_packets)
-                    / (ctx->total_tx_batches - ctx->last_total_tx_batches));
+    p = sprintf(linebuf, "CPU %d: %'10ld pps, %6.3f Gbps (%.1f pkts/batch)",
+                ctx->my_cpu, tx_pps, (tx_bps + (tx_pps * ETH_EXTRA_BYTES) * 8) / 1e9f,
+                (float) (ctx->total_tx_packets - ctx->last_total_tx_packets)
+                        / (ctx->total_tx_batches - ctx->last_total_tx_batches));
 
     if (ctx->latency_measure && ctx->cnt_latency > 0) {
-        printf("  %7.2f us (%'9lu samples)",
-               ((ctx->accum_latency / ctx->cnt_latency) / (ctx->tsc_hz / 1e6f)),
-               ctx->cnt_latency);
+        p += sprintf(linebuf + p, "  %7.2f us (%'9lu samples)",
+                     ((ctx->accum_latency / ctx->cnt_latency) / (ctx->tsc_hz / 1e6f)),
+                     ctx->cnt_latency);
         ctx->accum_latency = 0;
         ctx->cnt_latency = 0;
 
@@ -481,11 +480,10 @@ void update_stats(struct rte_timer *tim, void *arg)
 
         tx_pps = ctx->tx_packets[port_idx];
         tx_bps = ctx->tx_bytes[port_idx] * 8;
-        printf("  %s.%d: %'10ld pps,%6.3f Gbps",
-                driver, port_idx, tx_pps, (tx_bps + (tx_pps * ETH_EXTRA_BYTES) * 8) / 1000000000.0);
+        p += sprintf(linebuf + p, "  %s.%d: %'10ld pps,%6.3f Gbps",
+                     driver, port_idx, tx_pps, (tx_bps + (tx_pps * ETH_EXTRA_BYTES) * 8) / 1e9f);
     }
-    printf("\n");
-    fflush(stdout);
+    printf("%s\n", linebuf);
 
     ctx->elapsed_sec ++;
     if (ctx->time_limit > 0 && ctx->elapsed_sec >= ctx->time_limit)
