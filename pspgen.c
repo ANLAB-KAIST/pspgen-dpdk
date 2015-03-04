@@ -1419,6 +1419,7 @@ int main(int argc, char **argv)
         ctx->batch_size      = batch_size;
         ctx->packet_size     = packet_size;
         ctx->min_packet_size = min_packet_size;
+        ctx->ip_version      = ip_version;
         ctx->num_flows       = num_flows;
         ctx->loop_count      = loop_count;
         ctx->begin           = begin_datetime;
