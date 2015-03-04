@@ -63,6 +63,12 @@ extern char *if_indextoname (unsigned int __ifindex, char *__ifname);
 #define IPPROTO_ICMPv6_CUSTOM       58
 #define IPPROTO_OSPF_CUSTOM         89
 
+struct rate_limiter_state {
+    uint64_t rate;        /** in Mbits/sec. */
+    uint64_t started_at;  /** the beginning timestamp. */
+    uint64_t sent;        /** in Mbits, including ethernet overheads. */
+};
+
 struct pspgen_context {
     /* About myself */
     int num_cpus;
@@ -107,6 +113,8 @@ struct pspgen_context {
     /* States */
     rte_atomic16_t working;
     uint64_t elapsed_sec;
+    bool use_rate_limiter;
+    struct rate_limiter_state rate_limiters[PS_MAX_DEVICES];
 
     /* Statistics */
     uint64_t total_tx_packets;
@@ -393,27 +401,24 @@ void preprocess_pcap_file() {
     printf("File size: %zu, number of packet: %ld\n", pcap_filesize, pcap_num_pkts_total);
 }
 
-#define MAX_CONNS (PS_MAX_DEVICES * 64)
-static uint64_t _rate[MAX_CONNS];
-static uint64_t _started_at[MAX_CONNS];
-static uint64_t _sent[MAX_CONNS];
+static void init_rate_limit(struct rate_limiter_state *r, uint64_t rate)
+{
+    r->rate = rate;
+    r->sent = 0;
+    r->started_at = (uint64_t) (rte_get_tsc_cycles() / (rte_get_tsc_hz() / 1e6));
+}
 
-static void init_rate_limit(int conn_id, uint64_t rate)
+static long check_rate(struct rate_limiter_state *r)
 {
-    _rate[conn_id] = rate;
-    _started_at[conn_id] = ps_get_usec();
-    _sent[conn_id] = 0;
+    uint64_t now = (uint64_t) (rte_get_tsc_cycles() / (rte_get_tsc_hz() / 1e6));
+    uint64_t should_have_sent = (uint64_t)((now - r->started_at) / 1e6 * r->rate);
+    //printf("sent %lu, should_have_sent %lu, diff %ld\n", r->sent, should_have_sent, (long) should_have_sent - r->sent);
+    return (long) should_have_sent - r->sent;
 }
-static unsigned check_rate(int conn_id)
+
+static void update_rate(struct rate_limiter_state *r, uint64_t value)
 {
-    uint64_t now = ps_get_usec();
-    unsigned should_have_sent = (unsigned)((now - _started_at[conn_id]) / 1.0e6 * _rate[conn_id]);
-    //printf("sent %lu, should_have_sent %lu, diff %lu\n", _sent[conn_id], should_have_sent, should_have_sent - _sent[conn_id]);
-    return should_have_sent - _sent[conn_id];
-}
-static void update_rate(int conn_id, uint64_t value)
-{
-    _sent[conn_id] += value;
+    r->sent += value;
 }
 
 void stop_all(void)
@@ -451,7 +456,7 @@ void update_stats(struct rte_timer *tim, void *arg)
     int p = 0;
     uint64_t tx_pps = (ctx->total_tx_packets - ctx->last_total_tx_packets) / (usec_diff / 1e6f);
     uint64_t tx_bps = ((ctx->total_tx_bytes - ctx->last_total_tx_bytes) * 8) / (usec_diff / 1e6f);
-    p = sprintf(linebuf, "CPU %d: %'10ld pps, %6.3f Gbps (%.1f pkts/batch)",
+    p = sprintf(linebuf, "CPU %d: %'10ld pps, %6.3f Gbps (%5.1f pkts/batch)",
                 ctx->my_cpu, tx_pps, (tx_bps + (tx_pps * ETH_EXTRA_BYTES) * 8) / 1e9f,
                 (float) (ctx->total_tx_packets - ctx->last_total_tx_packets)
                         / (ctx->total_tx_batches - ctx->last_total_tx_batches));
@@ -696,34 +701,48 @@ int send_packets(void *arg)
 
     for (int port_idx = 0; port_idx < ctx->num_attached_ports; port_idx++) {
         next_flow[port_idx] = 0;
-        if (ctx->latency_measure) {
-            if (ctx->ip_version == 4)
-                ctx->latency_offset = sizeof(struct ether_hdr) + sizeof(struct ipv4_hdr) + sizeof(struct udp_hdr);
-            else
-                ctx->latency_offset = sizeof(struct ether_hdr) + offsetof(struct ipv6_hdr, src_addr) + 4;
-        }
+    }
+    if (ctx->latency_measure) {
+        if (ctx->ip_version == 4)
+            ctx->latency_offset = sizeof(struct ether_hdr) + sizeof(struct ipv4_hdr) + sizeof(struct udp_hdr);
+        else
+            ctx->latency_offset = sizeof(struct ether_hdr) + sizeof(struct ipv6_hdr) + sizeof(struct udp_hdr);
     }
 
-    if (ctx->offered_throughput > 0.0f) {
+    if (ctx->offered_throughput > 0.0) {
         /* Calculate desired the TX rate for me. */
         /* The net rate of all pspgen instances should be offered_throughput. */
         uint16_t actual_rate = (uint16_t) ((ctx->offered_throughput * 1000.0)  /* Mbps */
-                                           / ctx->num_txq_per_port);
+                                           / ctx->num_attached_ports / ctx->num_cpus);
+        printf("TX rate limit: %u Mbps per port per core\n", actual_rate);
+        ctx->use_rate_limiter = false;
         for (int i = 0; i < ctx->num_attached_ports; i++) {
             int port_idx = ctx->attached_ports[i];
-            rte_eth_set_queue_rate_limit(port_idx, ctx->ring_idx, actual_rate);
-            //init_rate_limit(i, actual_rate);
+            /* Try hardware-supported rate limiting. */
+            /* NOTE: ixgbe's hardware rate limiter take account of CRC tail
+             *       of Ethernet frames! */
+            /* NOTE: Since we need estimated packet counts to adjust the
+             *       rate limiter, the rate limiting may not be accurate
+             *       when using traces and random sized packets. */
+            uint16_t rate_adj = (ETH_EXTRA_BYTES - ETHER_CRC_LEN) * 8 * (actual_rate * 1e3 / 8 / (ctx->packet_size + ETH_EXTRA_BYTES)) / 1e3;
+            int ret = rte_eth_set_queue_rate_limit(port_idx, ctx->ring_idx, actual_rate - rate_adj);
+            if (ret == -ENOTSUP) {
+                printf("  HW rate limiter is not available, falling back to software rate limiter.\n");
+                ctx->use_rate_limiter = true;
+                init_rate_limit(&ctx->rate_limiters[port_idx], actual_rate);
+            } else {
+                printf("  Setting HW rate limiter on %d:%d (result: %s)\n", port_idx, ctx->ring_idx, strerror(ret));
+                assert(ret == 0);
+            }
         }
     }
 
-    if (ctx->latency_measure) {
+    if (ctx->latency_measure && ctx->latency_record) {
         char latency_log_name[MAX_PATH];
-        if (ctx->latency_record) {
-            snprintf(latency_log_name, sizeof(latency_log_name), "latency-%s-cpu%02d-%02d%02d%02d.%02d%02d%02d.log",
-                     ctx->latency_record_prefix, ctx->my_cpu, ctx->begin.tm_year, ctx->begin.tm_mon + 1, ctx->begin.tm_mday,
-                     ctx->begin.tm_hour, ctx->begin.tm_min, ctx->begin.tm_sec);
-            ctx->latency_log = fopen(latency_log_name, "w");
-        }
+        snprintf(latency_log_name, sizeof(latency_log_name), "latency-%s-cpu%02d-%02d%02d%02d.%02d%02d%02d.log",
+                 ctx->latency_record_prefix, ctx->my_cpu, ctx->begin.tm_year, ctx->begin.tm_mon + 1, ctx->begin.tm_mday,
+                 ctx->begin.tm_hour, ctx->begin.tm_min, ctx->begin.tm_sec);
+        ctx->latency_log = fopen(latency_log_name, "w");
     }
 
     rte_atomic16_init(&ctx->working);
@@ -733,7 +752,16 @@ int send_packets(void *arg)
     while (rte_atomic16_read(&ctx->working) == 1) {
         for (int i = 0; i < ctx->num_attached_ports; i++) {
             int port_idx = ctx->attached_ports[i];
+            long need_to_send_bytes = 0;
             struct rte_mbuf *pkts[ctx->batch_size];
+
+            if (ctx->offered_throughput > 0 && ctx->use_rate_limiter) {
+                need_to_send_bytes = check_rate(&ctx->rate_limiters[port_idx]);
+                if (need_to_send_bytes <= 0) {
+                    //rte_delay_us((uint64_t) (-need_to_send_bytes * 8 / 1000.0) / ctx->rate_limiters[port_idx].rate * 1000000.0);
+                    goto skip_tx_packets;
+                }
+            }
 
             /* Fill the chunk with packets generated. */
             assert(0 == rte_mempool_sc_get_bulk(ctx->tx_mempools[port_idx], (void **) &pkts[0], ctx->batch_size));
@@ -789,23 +817,19 @@ int send_packets(void *arg)
                 }
             }
 
-            //if (ctx->offered_throughput > 0) {
-            //    unsigned need_to_send_bytes = check_rate(i);
-            //    if (need_to_send_bytes < 0) {
-            //        usleep(-need_to_send_bytes / _rate[i] * 1000000);
-            //        continue;
-            //    }
-            //    //update_rate(i, chunk.cnt * (ETH_EXTRA_BYTES + packet_size));
-            //}
-
             unsigned sent_cnt = 0;
-            sent_cnt = rte_eth_tx_burst((uint8_t) port_idx, ctx->ring_idx,
-                                        pkts, ctx->batch_size);
+            unsigned to_send  = ctx->batch_size; //RTE_MAX(1, RTE_MIN(ctx->batch_size, (int) ((float) need_to_send_bytes / ctx->packet_size)));
+            unsigned sent_bytes = 0;
+            sent_cnt = rte_eth_tx_burst((uint8_t) port_idx, ctx->ring_idx, pkts, to_send);
             for (int j = 0; j < sent_cnt; j++)
-                ctx->tx_bytes[port_idx] += rte_pktmbuf_data_len(pkts[j]);
+                sent_bytes += rte_pktmbuf_data_len(pkts[j]);
             if (sent_cnt < ctx->batch_size) {
                 for (int j = sent_cnt; j < ctx->batch_size; j++)
                     rte_pktmbuf_free(pkts[j]);
+            }
+            ctx->tx_bytes[port_idx] += sent_bytes;
+            if (ctx->offered_throughput > 0 && ctx->use_rate_limiter) {
+                update_rate(&ctx->rate_limiters[port_idx], (sent_cnt * ETH_EXTRA_BYTES + sent_bytes) * 8 / 1000.0);
             }
             /* PCAP replay: check the number of packets not sent */
             pcap_num_pkts_not_sent += ctx->batch_size - sent_cnt;
@@ -829,12 +853,9 @@ int send_packets(void *arg)
 
             if (ctx->num_flows)
                 next_flow[port_idx] = (next_flow[port_idx] + sent_cnt) % ctx->num_flows;
-        }
 
-        if (ctx->latency_measure) {
-            for (int i = 0; i < ctx->num_attached_ports; i++) {
-                uint8_t port_idx = (uint8_t) ctx->attached_ports[i];
-                struct rte_mbuf *pkts[ctx->batch_size];
+skip_tx_packets:
+            if (ctx->latency_measure) {
                 unsigned recv_cnt = rte_eth_rx_burst(port_idx, ctx->ring_idx, &pkts[0], ctx->batch_size);
                 uint64_t timestamp = rte_get_tsc_cycles();
 
@@ -857,10 +878,11 @@ int send_packets(void *arg)
                 ctx->rx_packets[port_idx] += recv_cnt;
                 ctx->rx_batches[port_idx] += 1;
             }
-        }
+        } /* end of for(attached_ports) */
 
         rte_timer_manage();
-    }
+
+    } /* end of while(working) */
 
     if (ctx->latency_log) {
         fclose(ctx->latency_log);
@@ -901,7 +923,6 @@ void print_usage(const char *program)
            "[--loglevel <debug|info|...|critical|emergency>] "
            "[--neighbor-conf <neighbor_config_file>]\n",
            program);
-    // TODO: add latency record option
     printf("\nTo replay traces (currently only supports pcap):\n");
     printf("  %s -i all|dev1 [-i dev2] ... --trace <file_name> [--repeat] [--debug]\n\n", program);
 
@@ -1402,6 +1423,7 @@ int main(int argc, char **argv)
         ctx->loop_count      = loop_count;
         ctx->begin           = begin_datetime;
         ctx->time_limit      = time_limit;
+        ctx->offered_throughput = offered_throughput;
 
         ctx->latency_measure = latency_measure;
         ctx->latency_record  = latency_record;
