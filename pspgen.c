@@ -783,10 +783,11 @@ int send_packets(void *arg)
             }
 
             if (ctx->latency_measure) {
+                uint64_t timestamp = rte_get_tsc_cycles();
                 for (int j = 0; j < ctx->batch_size; j++) {
                     char *ptr = rte_pktmbuf_mtod(pkts[j], char *) + ctx->latency_offset;
                     *((uint32_t *)ptr) = ctx->magic_number;
-                    *((uint64_t *)(ptr + sizeof(uint32_t))) = rte_get_tsc_cycles();
+                    *((uint64_t *)(ptr + sizeof(uint32_t))) = timestamp;
                 }
             }
 
@@ -837,13 +838,15 @@ int send_packets(void *arg)
                 uint8_t port_idx = (uint8_t) ctx->attached_ports[i];
                 struct rte_mbuf *pkts[ctx->batch_size];
                 unsigned recv_cnt = rte_eth_rx_burst(port_idx, ctx->ring_idx, &pkts[0], ctx->batch_size);
+                uint64_t timestamp = rte_get_tsc_cycles();
 
                 for (unsigned j = 0; j < recv_cnt; j++) {
                     char *buf = rte_pktmbuf_mtod(pkts[j], char *) + ctx->latency_offset;
 
+                    /* Filter only packets sent from this core. */
                     if (*(uint32_t *)buf == ctx->magic_number) {
                         uint64_t old_rdtsc = *(uint64_t *)(buf + 4);
-                        uint64_t latency = rte_get_tsc_cycles() - old_rdtsc;
+                        uint64_t latency = timestamp - old_rdtsc;
                         ctx->cnt_latency ++;
                         ctx->accum_latency += latency;
                         ctx->latency_buckets[(unsigned) (latency / (ctx->tsc_hz / 1e6f))]++;
