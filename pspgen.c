@@ -461,6 +461,9 @@ void update_stats(struct rte_timer *tim, void *arg)
         printf(" %9.2f us %7lu",
                ((ctx->accum_latency / ctx->cnt_latency) / (ctx->tsc_hz / 1e6f)),
                ctx->cnt_latency);
+        ctx->accum_latency = 0;
+        ctx->cnt_latency = 0;
+
         if (ctx->latency_record && ctx->latency_log != NULL) {
             fprintf(ctx->latency_log, "-----------\n");
             for (int j = 0; j < MAX_LATENCY; j++) {
@@ -469,8 +472,6 @@ void update_stats(struct rte_timer *tim, void *arg)
             fflush(ctx->latency_log);
             memset(ctx->latency_buckets, 0, sizeof(uint64_t) * MAX_LATENCY);
         }
-        ctx->accum_latency = 0;
-        ctx->cnt_latency = 0;
     }
 
     for (int i = 0; i < ctx->num_attached_ports; i++) {
@@ -837,7 +838,7 @@ int send_packets(void *arg)
                 unsigned recv_cnt = rte_eth_rx_burst(port_idx, ctx->ring_idx, &pkts[0], ctx->batch_size);
 
                 for (unsigned j = 0; j < recv_cnt; j++) {
-                    char *buf = rte_pktmbuf_mtod(pkts[j], char *);
+                    char *buf = rte_pktmbuf_mtod(pkts[j], char *) + ctx->latency_offset;
 
                     if (*(uint32_t *)buf == ctx->magic_number) {
                         uint64_t old_rdtsc = *(uint64_t *)(buf + 4);
@@ -1398,7 +1399,6 @@ int main(int argc, char **argv)
         ctx->num_flows       = num_flows;
         ctx->loop_count      = loop_count;
         ctx->begin           = begin_datetime;
-
         ctx->time_limit      = time_limit;
 
         ctx->latency_measure = latency_measure;
