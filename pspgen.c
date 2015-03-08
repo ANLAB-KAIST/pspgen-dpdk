@@ -403,22 +403,26 @@ void preprocess_pcap_file() {
 
 static void init_rate_limit(struct rate_limiter_state *r, uint64_t rate)
 {
-    r->rate = rate;
+    r->rate = rate;  /* mbits/sec */
     r->sent = 0;
-    r->started_at = (uint64_t) (rte_get_tsc_cycles() / (rte_get_tsc_hz() / 1e6));
+    r->started_at = rte_get_tsc_cycles();
 }
 
-static long check_rate(struct rate_limiter_state *r)
+static int64_t check_rate(struct rate_limiter_state *r)
 {
-    uint64_t now = (uint64_t) (rte_get_tsc_cycles() / (rte_get_tsc_hz() / 1e6));
-    uint64_t should_have_sent = (uint64_t)((now - r->started_at) / 1e6 * r->rate);
-    //printf("sent %lu, should_have_sent %lu, diff %ld\n", r->sent, should_have_sent, (long) should_have_sent - r->sent);
-    return (long) should_have_sent - r->sent;
+    uint64_t now = rte_get_tsc_cycles();
+    uint64_t should_have_sent = (uint64_t)((now - r->started_at) / (double) rte_get_tsc_hz() * r->rate);  /* mbits */
+    return (int64_t) should_have_sent - r->sent;
 }
 
-static void update_rate(struct rate_limiter_state *r, uint64_t value)
+static void update_rate(struct rate_limiter_state *r, uint64_t mbits)
 {
-    r->sent += value;
+    uint64_t now = rte_get_tsc_cycles();
+    if (r->started_at < now - rte_get_tsc_hz()) {
+        r->started_at = now;
+        r->sent = 0;
+    }
+    r->sent += mbits;
 }
 
 void stop_all(void)
@@ -712,27 +716,37 @@ int send_packets(void *arg)
     if (ctx->offered_throughput > 0.0) {
         /* Calculate desired the TX rate for me. */
         /* The net rate of all pspgen instances should be offered_throughput. */
-        uint16_t actual_rate = (uint16_t) ((ctx->offered_throughput * 1000.0)  /* Mbps */
+        uint16_t actual_rate = (uint16_t) ((ctx->offered_throughput * 1e3)  /* Mbps */
                                            / ctx->num_attached_ports / ctx->num_cpus);
         printf("TX rate limit: %u Mbps per port per core\n", actual_rate);
         ctx->use_rate_limiter = false;
         for (int i = 0; i < ctx->num_attached_ports; i++) {
             int port_idx = ctx->attached_ports[i];
-            /* Try hardware-supported rate limiting. */
-            /* NOTE: ixgbe's hardware rate limiter take account of CRC tail
-             *       of Ethernet frames! */
-            /* NOTE: Since we need estimated packet counts to adjust the
-             *       rate limiter, the rate limiting may not be accurate
-             *       when using traces and random sized packets. */
-            uint16_t rate_adj = (ETH_EXTRA_BYTES - ETHER_CRC_LEN) * 8 * (actual_rate * 1e3 / 8 / (ctx->packet_size + ETH_EXTRA_BYTES)) / 1e3;
-            int ret = rte_eth_set_queue_rate_limit(port_idx, ctx->ring_idx, actual_rate - rate_adj);
-            if (ret == -ENOTSUP) {
-                printf("  HW rate limiter is not available, falling back to software rate limiter.\n");
+            if (ctx->latency_measure) {
+                /* HW rate limiter causes high latnecy because the timing
+                 * of timestamping and transmission differs significantly.
+                 * Latency measurement should use SW rate limiter always
+                 * unless we use hardware timestamping. */
+                printf("  Setting SW rate limiter for latency measurements...\n");
                 ctx->use_rate_limiter = true;
                 init_rate_limit(&ctx->rate_limiters[port_idx], actual_rate);
             } else {
-                printf("  Setting HW rate limiter on %d:%d (result: %s)\n", port_idx, ctx->ring_idx, strerror(ret));
-                assert(ret == 0);
+                /* Try hardware-supported rate limiting. */
+                /* NOTE: ixgbe's hardware rate limiter take account of CRC tail
+                 *       of Ethernet frames! */
+                /* NOTE: Since we need estimated packet counts to adjust the
+                 *       rate limiter, the rate limiting may not be accurate
+                 *       when using traces and random sized packets. */
+                uint16_t rate_adj = (ETH_EXTRA_BYTES - ETHER_CRC_LEN) * 8 * (actual_rate * 1e3 / 8 / (ctx->packet_size + ETH_EXTRA_BYTES)) / 1e3;
+                int ret = rte_eth_set_queue_rate_limit(port_idx, ctx->ring_idx, actual_rate - rate_adj);
+                if (ret == -ENOTSUP) {
+                    printf("  HW rate limiter is not available, falling back to software rate limiter.\n");
+                    ctx->use_rate_limiter = true;
+                    init_rate_limit(&ctx->rate_limiters[port_idx], actual_rate);
+                } else {
+                    printf("  Setting HW rate limiter on %d:%d (result: %s)\n", port_idx, ctx->ring_idx, strerror(ret));
+                    assert(ret == 0);
+                }
             }
         }
     }
@@ -750,17 +764,16 @@ int send_packets(void *arg)
     size_t total_sent_cnt = 0;
 
     while (rte_atomic16_read(&ctx->working) == 1) {
+
         for (int i = 0; i < ctx->num_attached_ports; i++) {
             int port_idx = ctx->attached_ports[i];
-            long need_to_send_bytes = 0;
+            int64_t need_to_send_bytes = 0;
             struct rte_mbuf *pkts[ctx->batch_size];
 
             if (ctx->offered_throughput > 0 && ctx->use_rate_limiter) {
                 need_to_send_bytes = check_rate(&ctx->rate_limiters[port_idx]);
-                if (need_to_send_bytes <= 0) {
-                    //rte_delay_us((uint64_t) (-need_to_send_bytes * 8 / 1000.0) / ctx->rate_limiters[port_idx].rate * 1000000.0);
+                if (need_to_send_bytes <= 0)
                     goto skip_tx_packets;
-                }
             }
 
             /* Fill the chunk with packets generated. */
@@ -827,7 +840,7 @@ int send_packets(void *arg)
                 rte_mempool_sp_put_bulk(ctx->tx_mempools[port_idx], (void **) &pkts[sent_cnt], to_send - sent_cnt);
             ctx->tx_bytes[port_idx] += sent_bytes;
             if (ctx->offered_throughput > 0 && ctx->use_rate_limiter) {
-                update_rate(&ctx->rate_limiters[port_idx], (sent_cnt * ETH_EXTRA_BYTES + sent_bytes) * 8 / 1000.0);
+                update_rate(&ctx->rate_limiters[port_idx], (sent_cnt * ETH_EXTRA_BYTES + sent_bytes) * 8 / 1e6);
             }
             /* PCAP replay: check the number of packets not sent */
             pcap_num_pkts_not_sent += ctx->batch_size - sent_cnt;
@@ -853,6 +866,9 @@ int send_packets(void *arg)
                 next_flow[port_idx] = (next_flow[port_idx] + sent_cnt) % ctx->num_flows;
 
 skip_tx_packets:
+            if (ctx->offered_throughput > 0 && ctx->use_rate_limiter) {
+                update_rate(&ctx->rate_limiters[port_idx], 0);
+            }
             if (ctx->latency_measure) {
                 unsigned recv_cnt = rte_eth_rx_burst(port_idx, ctx->ring_idx, &pkts[0], ctx->batch_size);
                 uint64_t timestamp = rte_get_tsc_cycles();
@@ -955,7 +971,7 @@ int main(int argc, char **argv)
     int num_packets = 0;
     int batch_size  = 64;
     int packet_size = 60;
-    int min_packet_size = packet_size;
+    int min_packet_size = -1;
     int loop_count  = 1;
     unsigned time_limit = 0;
 
@@ -1124,7 +1140,6 @@ int main(int argc, char **argv)
                 rte_exit(EXIT_FAILURE, "Pktgen mode options are exclusive to trace-replay mode options.\n");
             mode = PKTGEN;
             packet_size = atoi(optarg);
-            min_packet_size = packet_size;
             assert(packet_size >= 60 && packet_size <= 1514);
             break;
         case 'f':
@@ -1185,6 +1200,8 @@ int main(int argc, char **argv)
     }
     if (mode == UNSET)
         print_usage(argv[0]);
+    if (min_packet_size == -1)
+        min_packet_size = packet_size;
     if (!randomize_flows && num_flows == 0)
         rte_exit(EXIT_FAILURE, "Number of flows must be specified when you use -r option (non-random dest address).\n");
     if (offered_throughput > 0 && min_packet_size != packet_size)
