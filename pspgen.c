@@ -401,9 +401,9 @@ void preprocess_pcap_file() {
     printf("File size: %zu, number of packet: %ld\n", pcap_filesize, pcap_num_pkts_total);
 }
 
-static void init_rate_limit(struct rate_limiter_state *r, uint64_t rate)
+static void init_rate_limit(struct rate_limiter_state *r, uint64_t bps)
 {
-    r->rate = rate;  /* mbits/sec */
+    r->rate = bps;  /* bits/sec */
     r->sent = 0;
     r->started_at = rte_get_tsc_cycles();
 }
@@ -411,18 +411,18 @@ static void init_rate_limit(struct rate_limiter_state *r, uint64_t rate)
 static int64_t check_rate(struct rate_limiter_state *r)
 {
     uint64_t now = rte_get_tsc_cycles();
-    uint64_t should_have_sent = (uint64_t)((now - r->started_at) / (double) rte_get_tsc_hz() * r->rate);  /* mbits */
+    uint64_t should_have_sent = (uint64_t)((now - r->started_at) / (double) rte_get_tsc_hz() * r->rate);  /* bits */
     return (int64_t) should_have_sent - r->sent;
 }
 
-static void update_rate(struct rate_limiter_state *r, uint64_t mbits)
+static void update_rate(struct rate_limiter_state *r, uint64_t sent_bits)
 {
     uint64_t now = rte_get_tsc_cycles();
     if (r->started_at < now - rte_get_tsc_hz()) {
         r->started_at = now;
         r->sent = 0;
     }
-    r->sent += mbits;
+    r->sent += sent_bits;
 }
 
 void stop_all(void)
@@ -716,9 +716,9 @@ int send_packets(void *arg)
     if (ctx->offered_throughput > 0.0) {
         /* Calculate desired the TX rate for me. */
         /* The net rate of all pspgen instances should be offered_throughput. */
-        uint16_t actual_rate = (uint16_t) ((ctx->offered_throughput * 1e3)  /* Mbps */
+        uint64_t actual_rate = (uint64_t) ((ctx->offered_throughput * 1e9)  /* bps */
                                            / ctx->num_attached_ports / ctx->num_cpus);
-        printf("TX rate limit: %u Mbps per port per core\n", actual_rate);
+        printf("TX rate limit: %'lu bps per port per core\n", actual_rate);
         ctx->use_rate_limiter = false;
         for (int i = 0; i < ctx->num_attached_ports; i++) {
             int port_idx = ctx->attached_ports[i];
@@ -737,8 +737,8 @@ int send_packets(void *arg)
                 /* NOTE: Since we need estimated packet counts to adjust the
                  *       rate limiter, the rate limiting may not be accurate
                  *       when using traces and random sized packets. */
-                uint16_t rate_adj = (ETH_EXTRA_BYTES - ETHER_CRC_LEN) * 8 * (actual_rate * 1e3 / 8 / (ctx->packet_size + ETH_EXTRA_BYTES)) / 1e3;
-                int ret = rte_eth_set_queue_rate_limit(port_idx, ctx->ring_idx, actual_rate - rate_adj);
+                uint64_t rate_adj =  actual_rate * (ETH_EXTRA_BYTES - ETHER_CRC_LEN) / (ctx->packet_size + ETH_EXTRA_BYTES);
+                int ret = rte_eth_set_queue_rate_limit(port_idx, ctx->ring_idx, (uint16_t) ((actual_rate - rate_adj) / 1e6));
                 if (ret == -ENOTSUP) {
                     printf("  HW rate limiter is not available, falling back to software rate limiter.\n");
                     ctx->use_rate_limiter = true;
@@ -840,7 +840,7 @@ int send_packets(void *arg)
                 rte_mempool_sp_put_bulk(ctx->tx_mempools[port_idx], (void **) &pkts[sent_cnt], to_send - sent_cnt);
             ctx->tx_bytes[port_idx] += sent_bytes;
             if (ctx->offered_throughput > 0 && ctx->use_rate_limiter) {
-                update_rate(&ctx->rate_limiters[port_idx], (sent_cnt * ETH_EXTRA_BYTES + sent_bytes) * 8 / 1e6);
+                update_rate(&ctx->rate_limiters[port_idx], (sent_cnt * ETH_EXTRA_BYTES + sent_bytes) * 8);
             }
             /* PCAP replay: check the number of packets not sent */
             pcap_num_pkts_not_sent += ctx->batch_size - sent_cnt;
@@ -1393,6 +1393,12 @@ int main(int argc, char **argv)
                 (link_info.link_speed == ETH_LINK_SPEED_10000) ? "10G" : "lower than 10G",
                 (link_info.link_duplex == ETH_LINK_FULL_DUPLEX) ? "full-duplex" : "half-duplex",
                 (link_info.link_status == 1) ? "UP" : "DOWN");
+
+        struct rte_eth_fc_conf fc_conf;
+        memset(&fc_conf, 0, sizeof(fc_conf));
+        rte_eth_dev_flow_ctrl_get(port_idx, &fc_conf);
+        RTE_LOG(INFO, MAIN, "port %u -- flow control mode: %d, autoneg: %d\n", port_idx,
+                fc_conf.mode, fc_conf.autoneg);
     }
 
     /* Initialize contexts. */
