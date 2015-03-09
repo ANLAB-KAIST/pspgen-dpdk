@@ -96,7 +96,7 @@ struct pspgen_context {
     bool latency_record;
     char latency_record_prefix[MAX_PATH];
     int latency_offset;
-    uint32_t magic_number;
+    uint16_t magic_number;
 
     int num_packets;
     int batch_size;
@@ -276,35 +276,6 @@ static uint64_t ps_get_usec(void)
     struct timespec now;
     clock_gettime(CLOCK_MONOTONIC_RAW, &now);
     return now.tv_sec * 1000000L + now.tv_nsec / 1000L;
-}
-
-static inline uint16_t ip_fast_csum(const void *iph, unsigned int ihl)
-{
-	unsigned int sum;
-	asm("  movl (%1), %0\n"
-	    "  subl $4, %2\n"
-	    "  jbe 2f\n"
-	    "  addl 4(%1), %0\n"
-	    "  adcl 8(%1), %0\n"
-	    "  adcl 12(%1), %0\n"
-	    "1: adcl 16(%1), %0\n"
-	    "  lea 4(%1), %1\n"
-	    "  decl %2\n"
-	    "  jne      1b\n"
-	    "  adcl $0, %0\n"
-	    "  movl %0, %2\n"
-	    "  shrl $16, %0\n"
-	    "  addw %w2, %w0\n"
-	    "  adcl $0, %0\n"
-	    "  notl %0\n"
-	    "2:"
-	    /* Since the input registers which are loaded with iph and ih
-	       are modified, we must also specify them as outputs, or gcc
-	       will assume they contain their original values. */
-	    : "=r" (sum), "=r" (iph), "=r" (ihl)
-	    : "1" (iph), "2" (ihl)
-	       : "memory");
-	return (uint16_t) sum;
 }
 
 static int ether_aton(const char *buf, size_t len, struct ether_addr *addr)
@@ -558,7 +529,7 @@ void build_packet(char *buf, int size, bool randomize, uint64_t *seed)
     }
 
     ip->hdr_checksum = 0;
-    ip->hdr_checksum = ip_fast_csum(ip, ip->version_ihl & 0x0f);
+    ip->hdr_checksum = rte_ipv4_cksum(ip);
 
     udp = (struct udp_hdr *)((char *)ip + sizeof(*ip));
 
@@ -571,6 +542,7 @@ void build_packet(char *buf, int size, bool randomize, uint64_t *seed)
     udp->dst_port = rte_cpu_to_be_16((rand_val >> 16) & 0xFFFF);
     udp->dgram_len   = rte_cpu_to_be_16(size - sizeof(*eth) - sizeof(*ip));
     udp->dgram_cksum = 0;
+    udp->dgram_cksum = rte_ipv4_udptcp_cksum(ip, udp);
 
     /* For debugging, we fill the packet content with a magic number 0xf0. */
     char *content = (char *)((char *)udp + sizeof(*udp));
@@ -595,15 +567,15 @@ void build_packet_v6(char *buf, int size, bool randomize, uint64_t *seed)
     ip = (struct ipv6_hdr *)(buf + sizeof(*eth));
     
     /* 4 bits: version, 8 bits: traffic class, 20 bits: flow label. */
-    ip->vtc_flow = rte_cpu_to_be_32((6 << 28) || (0 << 20) || (0));
-    ip->payload_len = rte_cpu_to_be_16(size - sizeof(*eth) - sizeof(*ip));
+    ip->vtc_flow = rte_cpu_to_be_32(6 << 28);
+    ip->payload_len = rte_cpu_to_be_16(size - sizeof(*eth) - sizeof(*ip)); /* The minimum is 10 bytes. */
     ip->proto = IP_TYPE_UDP;
     ip->hop_limits = 4;
     /* Currently we do not test source-routing. */
     ip->src_addr[0] = rte_cpu_to_be_32(0x0A000001);
-    ip->src_addr[1] = rte_cpu_to_be_32(0x00000000);
-    ip->src_addr[2] = rte_cpu_to_be_32(0x00000000);
-    ip->src_addr[3] = rte_cpu_to_be_32(0x00000000);
+    ip->src_addr[1] = rte_cpu_to_be_32(0x0C000000);
+    ip->src_addr[2] = rte_cpu_to_be_32(0x0B000000);
+    ip->src_addr[3] = rte_cpu_to_be_32(0x0E000000);
     ip->dst_addr[0] = rte_cpu_to_be_32(myrand(seed));
     ip->dst_addr[1] = rte_cpu_to_be_32(myrand(seed));
     ip->dst_addr[2] = rte_cpu_to_be_32(myrand(seed));
@@ -622,6 +594,7 @@ void build_packet_v6(char *buf, int size, bool randomize, uint64_t *seed)
     udp->dst_port = rte_cpu_to_be_16((rand_val >> 16) & 0xFFFF);
     udp->dgram_len   = rte_cpu_to_be_16(size - sizeof(*eth) - sizeof(*ip));
     udp->dgram_cksum = 0;
+    udp->dgram_cksum = rte_ipv6_udptcp_cksum(ip, udp);
 
     /* For debugging, we fill the packet content with a magic number 0xf0. */
     char *content = (char *)((char *)udp + sizeof(*udp));
@@ -711,6 +684,9 @@ int send_packets(void *arg)
             ctx->latency_offset = sizeof(struct ether_hdr) + sizeof(struct ipv4_hdr) + sizeof(struct udp_hdr);
         else
             ctx->latency_offset = sizeof(struct ether_hdr) + sizeof(struct ipv6_hdr) + sizeof(struct udp_hdr);
+        unsigned min_pkt_size_for_latency = ctx->latency_offset + sizeof(uint16_t) + sizeof(uint64_t);
+        if (min_pkt_size_for_latency > ctx->min_packet_size)
+            rte_exit(EXIT_FAILURE, "The packet size be must be larger than %u bytes for latency measurement!\n", min_pkt_size_for_latency);
     }
 
     if (ctx->offered_throughput > 0.0) {
@@ -782,6 +758,8 @@ int send_packets(void *arg)
                 int cur_pkt_size;
                 pkts[j]->refcnt = 1;
                 pkts[j]->nb_segs = 1;
+                pkts[j]->ol_flags = 0;
+
                 char *buf = rte_pktmbuf_mtod(pkts[j], char *);
 
                 if (ctx->mode == TRACE_REPLAY) {
@@ -825,8 +803,8 @@ int send_packets(void *arg)
                 uint64_t timestamp = rte_get_tsc_cycles();
                 for (int j = 0; j < ctx->batch_size; j++) {
                     char *ptr = rte_pktmbuf_mtod(pkts[j], char *) + ctx->latency_offset;
-                    *((uint32_t *)ptr) = ctx->magic_number;
-                    *((uint64_t *)(ptr + sizeof(uint32_t))) = timestamp;
+                    *((uint16_t *)ptr) = ctx->magic_number;
+                    *((uint64_t *)(ptr + sizeof(uint16_t))) = timestamp;
                 }
             }
 
@@ -877,8 +855,8 @@ skip_tx_packets:
                     char *buf = rte_pktmbuf_mtod(pkts[j], char *) + ctx->latency_offset;
 
                     /* Filter only packets sent from this core. */
-                    if (*(uint32_t *)buf == ctx->magic_number) {
-                        uint64_t old_rdtsc = *(uint64_t *)(buf + 4);
+                    if (*(uint16_t *)buf == ctx->magic_number) {
+                        uint64_t old_rdtsc = *(uint64_t *)(buf + sizeof(uint16_t));
                         uint64_t latency = timestamp - old_rdtsc;
                         ctx->cnt_latency ++;
                         ctx->accum_latency += latency;
@@ -898,14 +876,13 @@ skip_tx_packets:
         rte_timer_manage();
 
     } /* end of while(working) */
-
-    if (ctx->latency_log) {
+    if (ctx->latency_measure && ctx->latency_record && ctx->latency_log != NULL) {
         fclose(ctx->latency_log);
         ctx->latency_log = NULL;
     }
-    usleep(10000 * (ctx->my_cpu + 1));
 
-    printf("----------\n");
+    usleep(10000 * (ctx->my_cpu + 1));
+    if (ctx->my_cpu == 0) printf("----------\n");
     printf("CPU %d: total %'lu packets, %'lu bytes transmitted\n",
             ctx->my_cpu, ctx->total_tx_packets, ctx->total_tx_bytes);
     if (ctx->mode == TRACE_REPLAY) {
@@ -984,7 +961,6 @@ int main(int argc, char **argv)
     char latency_record_prefix[MAX_PATH] = {0,};
     double offered_throughput = -1.0f;
 
-    uint32_t magic_number = 0;
     char neighbor_conf_filename[MAX_PATH] = "neighbors.conf";
 
     uint64_t begin, end;
@@ -1170,8 +1146,6 @@ int main(int argc, char **argv)
                 latency_measure = true;
             else
                 latency_measure = (bool) atoi(optarg);
-            if (latency_measure)
-                magic_number = (uint32_t) RTE_MAGIC;
             break;
         case 'c':
             if (!(mode == UNSET || mode == PKTGEN))
@@ -1291,14 +1265,13 @@ int main(int argc, char **argv)
 
     struct rte_eth_conf port_conf;
     memset(&port_conf, 0, sizeof(port_conf));
-    port_conf.rxmode.mq_mode        = ETH_RSS;
-
+    port_conf.rxmode.mq_mode    = ETH_MQ_RX_RSS;
     uint8_t hash_key[40];
     for (unsigned k = 0; k < sizeof(hash_key); k++)
         hash_key[k] = (uint8_t) rand();
     port_conf.rx_adv_conf.rss_conf.rss_key = hash_key;
     port_conf.rx_adv_conf.rss_conf.rss_hf = ETH_RSS_IPV4_TCP | ETH_RSS_IPV4_UDP | ETH_RSS_IPV6_TCP | ETH_RSS_IPV6_UDP;
-    port_conf.txmode.mq_mode    = ETH_DCB_NONE;
+    port_conf.txmode.mq_mode    = ETH_MQ_TX_NONE;
     port_conf.fdir_conf.mode    = RTE_FDIR_MODE_NONE;
     port_conf.fdir_conf.pballoc = RTE_FDIR_PBALLOC_64K;
     port_conf.fdir_conf.status  = RTE_FDIR_NO_REPORT_STATUS;
@@ -1318,7 +1291,7 @@ int main(int argc, char **argv)
     tx_conf.tx_thresh.wthresh = 0;
     /* The following rs_thresh and flag value enables "simple TX" function. */
     tx_conf.tx_rs_thresh   = 32;
-    tx_conf.tx_free_thresh = 0; /* use PMD default value */
+    tx_conf.tx_free_thresh = 0;  /* use PMD default value */
     tx_conf.txq_flags      = ETH_TXQ_FLAGS_NOMULTSEGS | ETH_TXQ_FLAGS_NOOFFLOADS;
 
     const uint32_t num_mp_cache = 250;
@@ -1452,7 +1425,7 @@ int main(int argc, char **argv)
         ctx->latency_record  = latency_record;
         ctx->latency_log     = NULL;  /* opened in send_packets() */
         strncpy(ctx->latency_record_prefix, latency_record_prefix, MAX_PATH);
-        ctx->magic_number    = magic_number + my_cpu;
+        ctx->magic_number    = my_cpu;
 
         used_cores_per_node[node_id] ++;
     }
