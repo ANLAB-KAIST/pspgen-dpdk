@@ -1270,7 +1270,7 @@ int main(int argc, char **argv)
     for (unsigned k = 0; k < sizeof(hash_key); k++)
         hash_key[k] = (uint8_t) rand();
     port_conf.rx_adv_conf.rss_conf.rss_key = hash_key;
-    port_conf.rx_adv_conf.rss_conf.rss_hf = ETH_RSS_IPV4_TCP | ETH_RSS_IPV4_UDP | ETH_RSS_IPV6_TCP | ETH_RSS_IPV6_UDP;
+    port_conf.rx_adv_conf.rss_conf.rss_hf = ETH_RSS_IP | ETH_RSS_UDP | ETH_RSS_TCP;
     port_conf.txmode.mq_mode    = ETH_MQ_TX_NONE;
     port_conf.fdir_conf.mode    = RTE_FDIR_MODE_NONE;
     port_conf.fdir_conf.pballoc = RTE_FDIR_PBALLOC_64K;
