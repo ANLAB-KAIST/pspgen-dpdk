@@ -1318,11 +1318,8 @@ int main(int argc, char **argv)
             char mempool_name[RTE_MEMPOOL_NAMESIZE];
             snprintf(mempool_name, RTE_MEMPOOL_NAMESIZE,
                      "txmp_n%u_d%u_r%u", node_idx, port_idx, ring_idx);
-            mp = rte_mempool_create(mempool_name, num_mbufs, mbuf_size, num_mp_cache,
-                                    sizeof(struct rte_pktmbuf_pool_private),
-                                    rte_pktmbuf_pool_init, (void *)(uintptr_t) mbuf_size,
-                                    rte_pktmbuf_init, NULL,
-                                    node_idx, 0);
+            mp = rte_pktmbuf_pool_create(mempool_name, num_mbufs, num_mp_cache,
+                                         0, mbuf_size, node_idx);
             if (mp == NULL)
                 rte_exit(EXIT_FAILURE, "cannot allocate memory pool for txq %u:%u@%u.\n",
                          port_idx, ring_idx, node_idx);
@@ -1343,11 +1340,8 @@ int main(int argc, char **argv)
             snprintf(mempool_name, RTE_MEMPOOL_NAMESIZE,
                      "rxmp_n%u_d%u_r%u", node_idx, port_idx, ring_idx);
 
-            mp = rte_mempool_create(mempool_name, num_mbufs, mbuf_size, num_mp_cache,
-                                    sizeof(struct rte_pktmbuf_pool_private),
-                                    rte_pktmbuf_pool_init, (void *)(uintptr_t) mbuf_size,
-                                    rte_pktmbuf_init, NULL,
-                                    node_idx, 0);
+            mp = rte_pktmbuf_pool_create(mempool_name, num_mbufs, num_mp_cache,
+                                         0, mbuf_size, node_idx);
             if (mp == NULL)
                 rte_exit(EXIT_FAILURE, "cannot allocate memory pool for rxq %u:%u@%u.\n",
                          port_idx, ring_idx, node_idx);
