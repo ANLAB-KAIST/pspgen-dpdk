@@ -199,11 +199,10 @@ long    pkt_info_arr_index;
 
 static int ps_bind_cpu(int cpu) {
     struct bitmask *bmask;
-    size_t ncpus = rte_lcore_count();
 
-    bmask = numa_bitmask_alloc(ncpus);
+    bmask = numa_bitmask_alloc(RTE_MAX_LCORE);
     assert(bmask != NULL);
-    assert(cpu >= 0 && cpu < ncpus);
+    assert(cpu >= 0 && cpu < RTE_MAX_LCORE);
     numa_bitmask_clearall(bmask);
     numa_bitmask_setbit(bmask, cpu);
     numa_sched_setaffinity(0, bmask);
