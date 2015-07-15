@@ -71,7 +71,7 @@ struct rate_limiter_state {
 
 struct pspgen_context {
     /* About myself */
-    int num_cpus;
+    unsigned num_cpus;
     int my_node;
     int my_cpu;
     uint64_t tsc_hz;
@@ -159,8 +159,6 @@ static int devices_registered[PS_MAX_DEVICES];
 /* Target neighbors */
 static int num_neighbors = 0;
 static struct ether_addr neighbor_ethaddrs[PS_MAX_DEVICES];
-static uint32_t neighbor_ipv4addrs[PS_MAX_DEVICES];
-static uint8_t neighbor_ipv6addrs[PS_MAX_DEVICES][16];
 
 /* Trace replay-related variable & structs */
 
@@ -199,37 +197,9 @@ pcap_pkt_info_t *pcap_pkt_info_arr;
 long    pkt_info_arr_index;
 /* pcap_replaying: end */
 
-static int ps_num_hyperthreading_siblings(void) {
-    // TODO: make it portable
-    static rte_spinlock_t _ht_func_lock = RTE_SPINLOCK_INITIALIZER;
-    static int memoized_result = -1;
-    rte_spinlock_lock(&_ht_func_lock);
-    if (memoized_result == -1) {
-        char line[2048];
-        unsigned len, i, count;
-        FILE *f = fopen("/sys/devices/system/cpu/cpu0/topology/thread_siblings_list", "r");
-        assert(NULL != f);
-        assert(NULL != fgets(line, 2048, f));
-        fclose(f);
-        len = strnlen(line, 2048);
-        count = 1;
-        for (i = 0; i < len; i++)
-            if (line[i] == ',')
-                count ++;
-        assert(count >= 1);
-        memoized_result = count;
-    }
-    rte_spinlock_unlock(&_ht_func_lock);
-    return memoized_result;
-}
-
-static int ps_get_num_cpus(void) {
-    return (int) sysconf(_SC_NPROCESSORS_ONLN) / ps_num_hyperthreading_siblings();
-}
-
 static int ps_bind_cpu(int cpu) {
     struct bitmask *bmask;
-    size_t ncpus = ps_get_num_cpus();
+    size_t ncpus = rte_lcore_count();
 
     bmask = numa_bitmask_alloc(ncpus);
     assert(bmask != NULL);
@@ -398,8 +368,8 @@ static void update_rate(struct rate_limiter_state *r, uint64_t sent_bits)
 
 void stop_all(void)
 {
-    int num_cpus = ps_get_num_cpus();
-    for (int c = 0; c < num_cpus; c++) {
+    unsigned c;
+    RTE_LCORE_FOREACH(c) {
         if (contexts[c] != NULL) {
             rte_atomic16_set(&contexts[c]->working, 0);
         }
@@ -944,7 +914,7 @@ int main(int argc, char **argv)
     int ret;
     int mode = UNSET;
 
-    int num_cpus    = 0;
+    unsigned num_cpus    = 0;
     int num_packets = 0;
     int batch_size  = 64;
     int packet_size = 60;
@@ -978,7 +948,7 @@ int main(int argc, char **argv)
     argv += ret;
 
     /* Initialize system information. */
-    num_cpus = ps_get_num_cpus();
+    num_cpus = rte_lcore_count();
     assert(num_cpus >= 1);
     num_devices = rte_eth_dev_count();
     assert(num_devices != -1);
@@ -1101,7 +1071,7 @@ int main(int argc, char **argv)
             mode = PKTGEN;
             num_packets = atoi(optarg);
             assert(num_packets >= 0);
-            if (num_packets < num_cpus / num_devices)
+            if (num_packets < (signed) num_cpus / num_devices)
                 fprintf(stderr, "WARNING: Too few packets would not utilize some interfaces.\n");
             break;
         case 's':
@@ -1227,7 +1197,7 @@ int main(int argc, char **argv)
     }
 
     /* Show the configuration. */
-    printf("# of CPUs = %d\n", num_cpus);
+    printf("# of CPUs = %u\n", num_cpus);
     printf("# of packets = %d\n", num_packets);
     printf("batch size = %d\n", batch_size);
     printf("packet size = %d\n", packet_size);
@@ -1377,7 +1347,8 @@ int main(int argc, char **argv)
     int used_cores_per_node[PS_MAX_NODES];
     memset(used_cores_per_node, 0, sizeof(int) * PS_MAX_NODES);
 
-    for (int my_cpu = 0; my_cpu < num_cpus; my_cpu++) {
+    unsigned my_cpu;
+    RTE_LCORE_FOREACH(my_cpu) {
         int node_id = numa_node_of_cpu(my_cpu);
         struct pspgen_context *ctx = rte_malloc_socket("pspgen_context", sizeof(struct pspgen_context),
                                                        RTE_CACHE_LINE_SIZE, node_id);
