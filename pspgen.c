@@ -722,6 +722,7 @@ int send_packets(void *arg)
             }
 
             /* Fill the chunk with packets generated. */
+            assert(NULL != ctx->tx_mempools[port_idx]);
             assert(0 == rte_mempool_sc_get_bulk(ctx->tx_mempools[port_idx], (void **) &pkts[0], ctx->batch_size));
             for (int j = 0; j < ctx->batch_size; j++) {
                 int cur_pkt_size;
@@ -1227,10 +1228,23 @@ int main(int argc, char **argv)
     /* Initialize devices and queues. */
     printf("Initializing interfaces...\n");
 
-    unsigned num_rxq_per_port = num_cpus / numa_num_configured_nodes();
-    unsigned num_txq_per_port = num_cpus / numa_num_configured_nodes();
+    unsigned num_rxq_per_port[PS_MAX_NODES];
+    unsigned num_txq_per_port[PS_MAX_NODES];
+    memset(num_rxq_per_port, 0, sizeof(unsigned) * PS_MAX_NODES);
+    memset(num_txq_per_port, 0, sizeof(unsigned) * PS_MAX_NODES);
     unsigned num_rx_desc = 512;
     unsigned num_tx_desc = 512;
+
+    for (int i = 0; i < num_devices_registered; i++) {
+        int c;
+        RTE_LCORE_FOREACH(c) {
+            if (ps_in_samenode(c, i)) {
+                int node_id = numa_node_of_cpu(c);
+                num_rxq_per_port[node_id] ++;
+                num_txq_per_port[node_id] ++;
+            }
+        }
+    }
 
     struct rte_eth_conf port_conf;
     memset(&port_conf, 0, sizeof(port_conf));
@@ -1279,10 +1293,10 @@ int main(int argc, char **argv)
         int port_idx = devices_registered[i];
         int ring_idx;
         int node_idx = devices[port_idx].pci_dev->numa_node;
-        assert(0 == rte_eth_dev_configure(port_idx, num_rxq_per_port, num_txq_per_port, &port_conf));
+        assert(0 == rte_eth_dev_configure(port_idx, num_rxq_per_port[node_idx], num_txq_per_port[node_idx], &port_conf));
 
         /* Initialize TX queues. */
-        for (ring_idx = 0; ring_idx < num_txq_per_port; ring_idx++) {
+        for (ring_idx = 0; ring_idx < num_txq_per_port[node_idx]; ring_idx++) {
             struct rte_mempool *mp = NULL;
             char mempool_name[RTE_MEMPOOL_NAMESIZE];
             snprintf(mempool_name, RTE_MEMPOOL_NAMESIZE,
@@ -1303,7 +1317,7 @@ int main(int argc, char **argv)
         /* Initialize RX queues. */
         /* They are used only when latency measure is enabled,
          * but they must be initialized always. */
-        for (int ring_idx = 0; ring_idx < num_rxq_per_port; ring_idx++) {
+        for (int ring_idx = 0; ring_idx < num_rxq_per_port[node_idx]; ring_idx++) {
             struct rte_mempool *mp = NULL;
             char mempool_name[RTE_MEMPOOL_NAMESIZE];
             snprintf(mempool_name, RTE_MEMPOOL_NAMESIZE,
@@ -1362,7 +1376,7 @@ int main(int argc, char **argv)
         ctx->my_cpu   = my_cpu;
         ctx->tsc_hz   = rte_get_tsc_hz();
 
-        ctx->num_txq_per_port = num_txq_per_port;
+        ctx->num_txq_per_port = num_txq_per_port[node_id];
         ctx->ring_idx   = used_cores_per_node[node_id];
         ctx->num_attached_ports = 0;
         for (int i = 0; i < num_devices_registered; i++) {
