@@ -890,7 +890,7 @@ void print_usage(const char *program)
 
     printf("  default <num_packets> is 0. (0 = infinite)\n");
     printf("    (note: <num_packets> is a per-cpu value.)\n");
-    printf("  default <chunk_size> is 64. packets per batch\n");
+    printf("  default <batch_size> is 32. packets per batch\n");
     printf("  default <packet_size> is 60. (w/o 4-byte CRC)\n");
     printf("  default <min_packet_size> is same to <packet_size>.\n"
            "    If set, it will generate packets randomly sized\n"
@@ -916,7 +916,7 @@ int main(int argc, char **argv)
 
     unsigned num_cpus    = 0;
     int num_packets = 0;
-    int batch_size  = 64;
+    int batch_size  = 32;
     int packet_size = 60;
     int min_packet_size = -1;
     int loop_count  = 1;
