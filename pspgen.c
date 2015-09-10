@@ -400,14 +400,17 @@ void update_stats(struct rte_timer *tim, void *arg)
     int p = 0;
     uint64_t tx_pps = (ctx->total_tx_packets - ctx->last_total_tx_packets) / (usec_diff / 1e6f);
     uint64_t tx_bps = ((ctx->total_tx_bytes - ctx->last_total_tx_bytes) * 8) / (usec_diff / 1e6f);
-    p = sprintf(linebuf, "CPU %d: %'10ld pps, %6.3f Gbps (%5.1f pkts/batch)",
+    p = sprintf(linebuf, "CPU %d: %'10ld pps, %6.3f Gbps (%5.1f pkts/batch), %'ld",
                 ctx->my_cpu, tx_pps, (tx_bps + (tx_pps * ETH_EXTRA_BYTES) * 8) / 1e9f,
                 (float) (ctx->total_tx_packets - ctx->last_total_tx_packets)
-                        / (ctx->total_tx_batches - ctx->last_total_tx_batches));
+                        / (ctx->total_tx_batches - ctx->last_total_tx_batches),
+                        ctx->cnt_latency
+                        );
 
     if (ctx->latency_measure && ctx->cnt_latency > 0) {
         p += sprintf(linebuf + p, "  %7.2f us (%'9lu samples)",
-                     ((ctx->accum_latency / ctx->cnt_latency) / (ctx->tsc_hz / 1e6f)),
+                     //((ctx->accum_latency / ctx->cnt_latency) / (ctx->tsc_hz / 1e6f)),
+                     ( (float)ctx->accum_latency / (float)ctx->cnt_latency),
                      ctx->cnt_latency);
         ctx->accum_latency = 0;
         ctx->cnt_latency = 0;
@@ -770,11 +773,17 @@ int send_packets(void *arg)
             }
 
             if (ctx->latency_measure) {
-                uint64_t timestamp = rte_get_tsc_cycles();
+                // Sangwook: Using HPET(clock_gettime()) instead of TSC
+                // to measure latency between TX & RX packet on different cores.
+                //uint64_t timestamp = rte_get_tsc_cycles();
+                struct timespec timestamp;
+                clock_gettime(CLOCK_MONOTONIC_RAW, &timestamp);
+
                 for (int j = 0; j < ctx->batch_size; j++) {
                     char *ptr = rte_pktmbuf_mtod(pkts[j], char *) + ctx->latency_offset;
                     *((uint16_t *)ptr) = ctx->magic_number;
-                    *((uint64_t *)(ptr + sizeof(uint16_t))) = timestamp;
+                    //*((uint64_t *)(ptr + sizeof(uint16_t))) = timestamp;
+                    *((struct timespec *)(ptr + sizeof(struct timespec))) = timestamp;
                 }
             }
 
@@ -819,20 +828,34 @@ skip_tx_packets:
             }
             if (ctx->latency_measure) {
                 unsigned recv_cnt = rte_eth_rx_burst(port_idx, ctx->ring_idx, &pkts[0], ctx->batch_size);
-                uint64_t timestamp = rte_get_tsc_cycles();
+                // Sangwook: Using HPET(clock_gettime()) instead of TSC
+                // to measure latency between TX & RX packet on different cores.
+                //uint64_t timestamp = rte_get_tsc_cycles();
+                struct timespec timestamp;
+                clock_gettime(CLOCK_MONOTONIC_RAW, &timestamp);
 
+                if (recv_cnt > 0) {
+                    //printf("Got pkt!\n");
+                }
                 for (unsigned j = 0; j < recv_cnt; j++) {
                     char *buf = rte_pktmbuf_mtod(pkts[j], char *) + ctx->latency_offset;
 
-                    /* Filter only packets sent from this core. */
-                    if (*(uint16_t *)buf == ctx->magic_number) {
+                    // Now latency can be checked by using timestamps from different cores.
+                    //if (*(uint16_t *)buf == ctx->magic_number) {
+                        /*
                         uint64_t old_rdtsc = *(uint64_t *)(buf + sizeof(uint16_t));
                         uint64_t latency = timestamp - old_rdtsc;
+                        */
+                        struct timespec timestamp_old = *(struct timespec *)(buf + sizeof(struct timespec));
+                        uint64_t latency = (timestamp.tv_sec - timestamp_old.tv_sec) * 1e6 + (timestamp.tv_sec - timestamp_old.tv_nsec) / 1000;
                         ctx->cnt_latency ++;
                         ctx->accum_latency += latency;
+                        /*
                         unsigned latency_us = (unsigned) (latency / (ctx->tsc_hz / 1e6f));
                         ctx->latency_buckets[RTE_MIN((unsigned) MAX_LATENCY, latency_us)]++;
-                    }
+                        */
+                        ctx->latency_buckets[RTE_MIN((unsigned) MAX_LATENCY, latency)]++;
+                    //}
 
                     ctx->rx_bytes[port_idx] += rte_pktmbuf_pkt_len(pkts[j]);
                     rte_pktmbuf_free(pkts[j]);
