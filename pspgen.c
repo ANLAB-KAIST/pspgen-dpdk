@@ -1235,13 +1235,22 @@ int main(int argc, char **argv)
     unsigned num_rx_desc = 512;
     unsigned num_tx_desc = 512;
 
-    for (int i = 0; i < num_devices_registered; i++) {
-        int c;
-        RTE_LCORE_FOREACH(c) {
-            if (ps_in_samenode(c, i)) {
-                int node_id = numa_node_of_cpu(c);
-                num_rxq_per_port[node_id] ++;
-                num_txq_per_port[node_id] ++;
+    for (int numa_idx = 0; numa_idx < numa_num_configured_nodes(); numa_idx++) {
+        // Find a device connected to this numa node.
+        int device_idx = 0;
+        for (int tmp_idx ; tmp_idx < num_devices_registered; tmp_idx++) {
+            int dev_numa_idx = devices[tmp_idx].pci_dev->numa_node;
+            if (numa_idx == dev_numa_idx) {
+                device_idx = tmp_idx;
+                break;
+            }
+        }
+        // Check the number of cpu cores connected to the numa node of found device.
+        int cpu_core;
+        RTE_LCORE_FOREACH(cpu_core) {
+            if (ps_in_samenode(cpu_core, device_idx)) {
+                num_rxq_per_port[numa_idx] ++;
+                num_txq_per_port[numa_idx] ++;
             }
         }
     }
