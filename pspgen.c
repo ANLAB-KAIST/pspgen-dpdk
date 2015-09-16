@@ -41,6 +41,7 @@ extern char *if_indextoname (unsigned int __ifindex, char *__ifname);
 #include <rte_ether.h>
 #include <rte_ip.h>
 #include <rte_udp.h>
+#include <rte_cycles.h>
 
 #define PS_MAX_NODES        4
 #define PS_MAX_CPUS         64
@@ -74,7 +75,7 @@ struct pspgen_context {
     unsigned num_cpus;
     int my_node;
     int my_cpu;
-    uint64_t tsc_hz;
+    uint64_t cycle_hz;
 
     int num_attached_ports;
     int num_txq_per_port;
@@ -146,6 +147,7 @@ static struct pspgen_context *contexts[PS_MAX_CPUS] = {NULL,};
 
 /* Global options. */
 static bool debug = false;
+static bool use_hpet_in_latency = false;
 
 /* Available devices in the system */
 static int num_devices = -1;
@@ -400,14 +402,16 @@ void update_stats(struct rte_timer *tim, void *arg)
     int p = 0;
     uint64_t tx_pps = (ctx->total_tx_packets - ctx->last_total_tx_packets) / (usec_diff / 1e6f);
     uint64_t tx_bps = ((ctx->total_tx_bytes - ctx->last_total_tx_bytes) * 8) / (usec_diff / 1e6f);
-    p = sprintf(linebuf, "CPU %d: %'10ld pps, %6.3f Gbps (%5.1f pkts/batch)",
+    p = sprintf(linebuf, "CPU %d: %'10ld pps, %6.3f Gbps (%5.1f pkts/batch), %'ld",
                 ctx->my_cpu, tx_pps, (tx_bps + (tx_pps * ETH_EXTRA_BYTES) * 8) / 1e9f,
                 (float) (ctx->total_tx_packets - ctx->last_total_tx_packets)
-                        / (ctx->total_tx_batches - ctx->last_total_tx_batches));
+                        / (ctx->total_tx_batches - ctx->last_total_tx_batches),
+                        ctx->cnt_latency
+                        );
 
     if (ctx->latency_measure && ctx->cnt_latency > 0) {
         p += sprintf(linebuf + p, "  %7.2f us (%'9lu samples)",
-                     ((ctx->accum_latency / ctx->cnt_latency) / (ctx->tsc_hz / 1e6f)),
+                     ((ctx->accum_latency / ctx->cnt_latency) / (ctx->cycle_hz / 1e6f)),
                      ctx->cnt_latency);
         ctx->accum_latency = 0;
         ctx->cnt_latency = 0;
@@ -770,11 +774,17 @@ int send_packets(void *arg)
             }
 
             if (ctx->latency_measure) {
-                uint64_t timestamp = rte_get_tsc_cycles();
+                uint64_t timestamp;
+                if (use_hpet_in_latency) {
+                    timestamp = rte_get_hpet_cycles();
+                } else {
+                    timestamp = rte_get_tsc_cycles();
+                }
+
                 for (int j = 0; j < ctx->batch_size; j++) {
                     char *ptr = rte_pktmbuf_mtod(pkts[j], char *) + ctx->latency_offset;
                     *((uint16_t *)ptr) = ctx->magic_number;
-                    *((uint64_t *)(ptr + sizeof(uint16_t))) = timestamp;
+                    *((uint64_t *)(ptr + sizeof(uint64_t))) = timestamp;
                 }
             }
 
@@ -819,18 +829,23 @@ skip_tx_packets:
             }
             if (ctx->latency_measure) {
                 unsigned recv_cnt = rte_eth_rx_burst(port_idx, ctx->ring_idx, &pkts[0], ctx->batch_size);
-                uint64_t timestamp = rte_get_tsc_cycles();
-
+                uint64_t timestamp;
+                if (use_hpet_in_latency) {
+                    timestamp = rte_get_hpet_cycles();
+                } else {
+                    timestamp = rte_get_tsc_cycles();
+                }
+                
                 for (unsigned j = 0; j < recv_cnt; j++) {
                     char *buf = rte_pktmbuf_mtod(pkts[j], char *) + ctx->latency_offset;
 
-                    /* Filter only packets sent from this core. */
-                    if (*(uint16_t *)buf == ctx->magic_number) {
-                        uint64_t old_rdtsc = *(uint64_t *)(buf + sizeof(uint16_t));
+                    if ( (use_hpet_in_latency == true) ||
+                         (use_hpet_in_latency == false && *(uint16_t *)buf == ctx->magic_number) ) {
+                        uint64_t old_rdtsc = *(uint64_t *)(buf + sizeof(uint64_t));
                         uint64_t latency = timestamp - old_rdtsc;
                         ctx->cnt_latency ++;
                         ctx->accum_latency += latency;
-                        unsigned latency_us = (unsigned) (latency / (ctx->tsc_hz / 1e6f));
+                        unsigned latency_us = (unsigned) (latency / (ctx->cycle_hz / 1e6f));
                         ctx->latency_buckets[RTE_MIN((unsigned) MAX_LATENCY, latency_us)]++;
                     }
 
@@ -883,7 +898,8 @@ void print_usage(const char *program)
            "[-g <offered_throughput>] "
            "[--debug] "
            "[--loglevel <debug|info|...|critical|emergency>] "
-           "[--neighbor-conf <neighbor_config_file>]\n",
+           "[--neighbor-conf <neighbor_config_file>] "
+           "[--use-hpet]\n",
            program);
     printf("\nTo replay traces (currently only supports pcap):\n");
     printf("  %s -i all|dev1 [-i dev2] ... --trace <file_name> [--repeat] [--debug]\n\n", program);
@@ -969,6 +985,7 @@ int main(int argc, char **argv)
         {"min-pkt-size", required_argument, NULL, 0},
         {"neighbor-conf", required_argument, NULL, 0},
         {"help", no_argument, NULL, 'h'},
+        {"use-hpet", no_argument, NULL, 0},
         {0, 0, 0, 0}
     };
     mode = UNSET;
@@ -1027,6 +1044,9 @@ int main(int argc, char **argv)
                 mode = PKTGEN;
                 strncpy(neighbor_conf_filename, optarg, MAX_PATH);
                 assert(strnlen(neighbor_conf_filename, MAX_PATH) > 0);
+            } else if (!strcmp("use-hpet", long_opts[optidx].name)) {
+                printf("getopt(): pspgen uses HPET in latency measurement.\n");
+                use_hpet_in_latency = true; 
             }
             break;
         case 'h':
@@ -1196,6 +1216,13 @@ int main(int argc, char **argv)
         preprocess_pcap_file();
     }
 
+    if (use_hpet_in_latency) {
+        // initialize HPET API but don't use it as default configuration. (default:TSC)
+        ret = rte_eal_hpet_init(0);
+        if (ret < 0)
+            rte_exit(EXIT_FAILURE, "Can't initialize DPDK's HPET API.\n");
+    }
+
     /* Show the configuration. */
     printf("# of CPUs = %u\n", num_cpus);
     printf("# of packets = %d\n", num_packets);
@@ -1206,6 +1233,7 @@ int main(int argc, char **argv)
     printf("randomize flows = %d\n", randomize_flows);
     printf("ip version = %d\n", ip_version);
     printf("latency measure = %d\n", latency_measure);
+    printf("using HPET in latency measurement = %d\n", use_hpet_in_latency);
     if (latency_record) {
         printf("  recording histogram using prefix \"%s\"\n", latency_record_prefix);
     }
@@ -1383,7 +1411,12 @@ int main(int argc, char **argv)
         ctx->num_cpus = num_cpus;
         ctx->my_node  = node_id;
         ctx->my_cpu   = my_cpu;
-        ctx->tsc_hz   = rte_get_tsc_hz();
+        
+        if (use_hpet_in_latency) {
+            ctx->cycle_hz   = rte_get_hpet_hz();
+        } else {
+            ctx->cycle_hz   = rte_get_tsc_hz();
+        }
 
         ctx->num_txq_per_port = num_txq_per_port[node_id];
         ctx->ring_idx   = used_cores_per_node[node_id];
