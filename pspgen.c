@@ -847,7 +847,7 @@ skip_tx_packets:
                         uint64_t latency = timestamp - old_rdtsc;
                         */
                         struct timespec timestamp_old = *(struct timespec *)(buf + sizeof(struct timespec));
-                        uint64_t latency = (timestamp.tv_sec - timestamp_old.tv_sec) * 1e6 + (timestamp.tv_sec - timestamp_old.tv_nsec) / 1000;
+                        uint64_t latency = (timestamp.tv_sec - timestamp_old.tv_sec) * 1e6 + (timestamp.tv_nsec - timestamp_old.tv_nsec) / 1000;
                         ctx->cnt_latency ++;
                         ctx->accum_latency += latency;
                         /*
