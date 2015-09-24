@@ -42,6 +42,7 @@ extern char *if_indextoname (unsigned int __ifindex, char *__ifname);
 #include <rte_ip.h>
 #include <rte_udp.h>
 #include <rte_cycles.h>
+#include <rte_mbuf.h>
 
 #define PS_MAX_NODES        4
 #define PS_MAX_CPUS         64
@@ -63,6 +64,8 @@ extern char *if_indextoname (unsigned int __ifindex, char *__ifname);
 #define IPPROTO_IPv6_FRAG_CUSTOM    44
 #define IPPROTO_ICMPv6_CUSTOM       58
 #define IPPROTO_OSPF_CUSTOM         89
+
+rte_spinlock_t global_lock;
 
 struct rate_limiter_state {
     uint64_t rate;        /** in Mbits/sec. */
@@ -514,12 +517,12 @@ void build_packet(char *buf, int size, bool randomize, uint64_t *seed)
     udp->dst_port = rte_cpu_to_be_16((rand_val >> 16) & 0xFFFF);
     udp->dgram_len   = rte_cpu_to_be_16(size - sizeof(*eth) - sizeof(*ip));
     udp->dgram_cksum = 0;
-    udp->dgram_cksum = rte_ipv4_udptcp_cksum(ip, udp);
 
     /* For debugging, we fill the packet content with a magic number 0xf0. */
     char *content = (char *)((char *)udp + sizeof(*udp));
     memset(content, 0xf0, size - sizeof(*eth) - sizeof(*ip) - sizeof(*udp));
     memset(content, 0xee, 1);  /* To indicate the beginning of packet content area. */
+    udp->dgram_cksum = rte_ipv4_udptcp_cksum(ip, udp);
 }
 
 void build_packet_v6(char *buf, int size, bool randomize, uint64_t *seed)
@@ -566,12 +569,12 @@ void build_packet_v6(char *buf, int size, bool randomize, uint64_t *seed)
     udp->dst_port = rte_cpu_to_be_16((rand_val >> 16) & 0xFFFF);
     udp->dgram_len   = rte_cpu_to_be_16(size - sizeof(*eth) - sizeof(*ip));
     udp->dgram_cksum = 0;
-    udp->dgram_cksum = rte_ipv6_udptcp_cksum(ip, udp);
 
     /* For debugging, we fill the packet content with a magic number 0xf0. */
     char *content = (char *)((char *)udp + sizeof(*udp));
     memset(content, 0xf0, size - sizeof(*eth) - sizeof(*ip) - sizeof(*udp));
     memset(content, 0xee, 1);  /* To indicate the beginning of packet content area. */
+    udp->dgram_cksum = rte_ipv6_udptcp_cksum(ip, udp);
 }
 
 void build_packet_from_trace(char *buf, char* packet, int captured_size, int actual_size) {
@@ -629,7 +632,6 @@ int send_packets(void *arg)
     struct rte_timer *stat_timer = rte_zmalloc("timer", sizeof(struct rte_timer), RTE_CACHE_LINE_SIZE);
     assert(stat_timer != NULL);
     rte_timer_init(stat_timer);
-    rte_timer_reset(stat_timer, rte_get_timer_hz() * 1, PERIODICAL, ctx->my_cpu, update_stats, (void *) ctx);
 
     if (ctx->num_flows == 0)
         seed = time(NULL) + ctx->my_cpu;
@@ -704,8 +706,12 @@ int send_packets(void *arg)
         snprintf(latency_log_name, sizeof(latency_log_name), "latency-%s-cpu%02d-%02d%02d%02d.%02d%02d%02d.log",
                  ctx->latency_record_prefix, ctx->my_cpu, ctx->begin.tm_year, ctx->begin.tm_mon + 1, ctx->begin.tm_mday,
                  ctx->begin.tm_hour, ctx->begin.tm_min, ctx->begin.tm_sec);
+rte_spinlock_lock(&global_lock);
         ctx->latency_log = fopen(latency_log_name, "w");
+rte_spinlock_unlock(&global_lock);
     }
+
+    rte_timer_reset(stat_timer, rte_get_timer_hz() * 1, PERIODICAL, ctx->my_cpu, update_stats, (void *) ctx);
 
     rte_atomic16_init(&ctx->working);
     rte_atomic16_set(&ctx->working, 1);
@@ -784,6 +790,21 @@ int send_packets(void *arg)
                     char *ptr = rte_pktmbuf_mtod(pkts[j], char *) + ctx->latency_offset;
                     *((uint16_t *)ptr) = ctx->magic_number;
                     *((uint64_t *)(ptr + sizeof(uint64_t))) = timestamp;
+                    void* pkt_start = rte_pktmbuf_mtod(pkts[j], void *);
+                    if (ctx->ip_version == 4)
+                    {
+                        struct ipv4_hdr* ipv4hdr = RTE_PTR_ADD(pkt_start, sizeof(struct ether_hdr));
+                        struct udp_hdr* udphdr = RTE_PTR_ADD(ipv4hdr, sizeof(struct ipv4_hdr));
+                        udphdr->dgram_cksum = 0;
+                        udphdr->dgram_cksum = rte_ipv4_udptcp_cksum(ipv4hdr, udphdr);
+                    }
+                    else
+                    {
+                        struct ipv6_hdr* ipv6hdr = RTE_PTR_ADD(pkt_start, sizeof(struct ether_hdr));
+                        struct udp_hdr* udphdr = RTE_PTR_ADD(ipv6hdr, sizeof(struct ipv6_hdr));
+                        udphdr->dgram_cksum = 0;
+                        udphdr->dgram_cksum = rte_ipv6_udptcp_cksum(ipv6hdr, udphdr);
+                    }
                 }
             }
 
@@ -925,6 +946,7 @@ void print_usage(const char *program)
 
 int main(int argc, char **argv)
 {
+    rte_spinlock_init(&global_lock);
     unsigned loglevel = RTE_LOG_WARNING;
     int ret;
     int mode = UNSET;
