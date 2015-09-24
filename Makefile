@@ -3,7 +3,7 @@ $(error "Please define RTE_SDK environment variable.")
 endif
 RTE_TARGET ?= x86_64-native-linuxapp-gcc
 PSPGEN_PMD ?= ixgbe
-PSPGEN_RTE_LIBS = rte_eal rte_cmdline rte_timer rte_malloc rte_mempool rte_mbuf rte_ring ethdev rte_pmd_$(PSPGEN_PMD)
+PSPGEN_RTE_LIBS = rte_eal rte_cmdline rte_timer rte_mempool rte_mbuf rte_ring ethdev rte_pmd_$(PSPGEN_PMD)
 ifeq ($(PSPGEN_PMD),mlx4)
 PSPGEN_RTE_LIBS += ibverbs
 endif
