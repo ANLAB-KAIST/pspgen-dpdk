@@ -13,6 +13,7 @@ export RTE_TARGET=x86_64-native-linuxapp-gcc
 export RTE_SDK=$HOME/dpdk/$RTE_TARGET
 export PSPGEN_PMD=ixgbe
 make
+$EDITOR neighbors.conf
 sudo ./pspgen -cff -n3 -- -i all -f 0 -v 4 -p 64
 ```
 Differently from the psio version, it takes two disjoin sets of arguments: one set for DPDK EAL and the other set for pspgen itself, separated by `--`.
@@ -21,6 +22,12 @@ You may not need `sudo` depending on your system configuration (`/dev/uioX` and 
 Change the EAL arguments according to your hardware.
 
 Another difference is that the device names are no longer `xge#` but `rte_ixgbe_pmd.#` (a string composed of DPDK driver name, dot, and the enumeration index) instead because DPDK-managed interfaces does not have host-bound interface names.
+
+`neighbors.conf` file should contain the destination MAC addresses one-to-one-mapped to the NIC ports used by pspgen-dpdk.
+(e.g., If you use 4 NIC ports to generate packets, then you need 4 destination MAC addresses.)
+The MAC addresses should be written in the standard colon-spearated six 2-digit hexademical numbers placed line-by-line.
+`neighbors.conf` should also specify the destination IP addresses at the end of each line, but currently they are not used and you may put `0.0.0.0` as placeholders.
+Each line looks like `01:23:45:67:89:ab 0.0.0.0`.
 
 ## Highlighted Features
 
