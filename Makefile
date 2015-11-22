@@ -7,6 +7,9 @@ PSPGEN_RTE_LIBS = rte_eal rte_cmdline rte_timer rte_mempool rte_mbuf rte_ring et
 ifeq ($(PSPGEN_PMD),mlx4)
 PSPGEN_RTE_LIBS += ibverbs
 endif
+ifeq ($(PSPGEN_PMD),mlnx_uio)
+PSPGEN_RTE_LIBS += rte_persistent rte_hash
+endif
 
 CFLAGS = -std=gnu99 -march=native -Wall -O2 -g -I$(RTE_SDK)/$(RTE_TARGET)/include
 LDFLAGS = -L$(RTE_SDK)/$(RTE_TARGET)/lib -pthread -lrt -lnuma -Wl,--whole-archive -Wl,--start-group $(patsubst %,-l%,$(PSPGEN_RTE_LIBS)) -Wl,--end-group -Wl,--no-whole-archive -ldl
