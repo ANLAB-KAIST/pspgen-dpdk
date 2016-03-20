@@ -23,6 +23,8 @@
 extern unsigned int if_nametoindex (const char *__ifname);
 extern char *if_indextoname (unsigned int __ifindex, char *__ifname);
 
+#include <zmq.h>
+
 #include <rte_config.h>
 #include <rte_common.h>
 #include <rte_eal.h>
@@ -84,6 +86,8 @@ struct pspgen_context {
     int num_txq_per_port;
     int attached_ports[PS_MAX_DEVICES];  /** The list of node-local ports. */
     int ring_idx;                        /** The queue ID for RX/TX in this core. */
+    void *zctx;
+    void *zsock;
     struct rte_mempool *tx_mempools[PS_MAX_DEVICES];
 
     /* Options */
@@ -144,7 +148,6 @@ struct pspgen_context {
     struct tm begin;  /* beginning time in wall-clock */
 
     uint64_t latency_buckets[MAX_LATENCY];
-    FILE *latency_log;
 };
 static struct pspgen_context *contexts[PS_MAX_CPUS] = {NULL,};
 
@@ -418,13 +421,24 @@ void update_stats(struct rte_timer *tim, void *arg)
         ctx->accum_latency = 0;
         ctx->cnt_latency = 0;
 
-        if (ctx->latency_record && ctx->latency_log != NULL) {
-            fprintf(ctx->latency_log, "----- %lu sec -----\n", ctx->elapsed_sec);
+        if (ctx->latency_record) {
+            // This "published" histogram data will be silently discarded
+            // if there is no endpoint connected.
+            char msgbuf[160000], *msgbufp;
+            size_t msglen;
+            msglen = sprintf(msgbuf, "%u", ctx->my_cpu);
+            zmq_send(ctx->zsock, msgbuf, msglen, ZMQ_SNDMORE);
+            msglen = sprintf(msgbuf, "%lu", ctx->elapsed_sec);
+            zmq_send(ctx->zsock, msgbuf, msglen, ZMQ_SNDMORE);
+            msgbufp = msgbuf;
+            // FIXME: optimize using binary representation?
             for (int j = 0; j < MAX_LATENCY; j++) {
-                if (ctx->latency_buckets[j] != 0)
-                    fprintf(ctx->latency_log, "%u %lu\n", j, ctx->latency_buckets[j]);
+                if (ctx->latency_buckets[j] != 0) {
+                    msgbufp += (uintptr_t) sprintf(msgbufp, "%u %lu\n", j, ctx->latency_buckets[j]);
+                }
             }
-            fflush(ctx->latency_log);
+            msglen = (uintptr_t) msgbufp - (uintptr_t) msgbuf;
+            zmq_send(ctx->zsock, msgbuf, msglen, 0);
             memset(ctx->latency_buckets, 0, sizeof(uint64_t) * MAX_LATENCY);
         }
     }
@@ -702,13 +716,15 @@ int send_packets(void *arg)
     }
 
     if (ctx->latency_measure && ctx->latency_record) {
-        char latency_log_name[MAX_PATH];
-        snprintf(latency_log_name, sizeof(latency_log_name), "latency-%s-cpu%02d-%02d%02d%02d.%02d%02d%02d.log",
-                 ctx->latency_record_prefix, ctx->my_cpu, ctx->begin.tm_year, ctx->begin.tm_mon + 1, ctx->begin.tm_mday,
-                 ctx->begin.tm_hour, ctx->begin.tm_min, ctx->begin.tm_sec);
-rte_spinlock_lock(&global_lock);
-        ctx->latency_log = fopen(latency_log_name, "w");
-rte_spinlock_unlock(&global_lock);
+        ctx->zsock = zmq_socket(ctx->zctx, ZMQ_PUB);
+        int port = 54000 + ctx->my_cpu;
+        char addrbuf[32];
+        sprintf(addrbuf, "tcp://*:%d", port);
+        int ret = zmq_bind(ctx->zsock, addrbuf);
+        if (ret != 0) {
+            perror("zmq_bind");
+            return -1;
+        }
     }
 
     rte_timer_reset(stat_timer, rte_get_timer_hz() * 1, PERIODICAL, ctx->my_cpu, update_stats, (void *) ctx);
@@ -882,9 +898,8 @@ skip_tx_packets:
         rte_timer_manage();
 
     } /* end of while(working) */
-    if (ctx->latency_measure && ctx->latency_record && ctx->latency_log != NULL) {
-        fclose(ctx->latency_log);
-        ctx->latency_log = NULL;
+    if (ctx->zsock != NULL) {
+        zmq_close(ctx->zsock);
     }
 
     usleep(10000 * (ctx->my_cpu + 1));
@@ -913,7 +928,7 @@ void print_usage(const char *program)
            "[-r <randomize_flows>] "
            "[-v <ip_version>] "
            "[-l <latency_measure>] "
-           "[--latency-record-prefix <prefix>] "
+           "[--latency-histogram] "
            "[-c <loop_count>] "
            "[-t <seconds>] "
            "[-g <offered_throughput>] "
@@ -965,7 +980,7 @@ int main(int argc, char **argv)
 
     bool latency_measure = false;
     bool latency_record  = false;
-    char latency_record_prefix[MAX_PATH] = {0,};
+    //char latency_record_prefix[MAX_PATH] = {0,};
     double offered_throughput = -1.0f;
 
     char neighbor_conf_filename[MAX_PATH] = "neighbors.conf";
@@ -1002,7 +1017,7 @@ int main(int argc, char **argv)
         {"trace", required_argument, NULL, 0},
         {"debug", no_argument, NULL, 0},
         {"loglevel", required_argument, NULL, 0},
-        {"latency-record-prefix", required_argument, NULL, 0},
+        {"latency-histogram", no_argument, NULL, 0},
         {"min-pkt-size", required_argument, NULL, 0},
         {"neighbor-conf", required_argument, NULL, 0},
         {"help", no_argument, NULL, 'h'},
@@ -1050,10 +1065,8 @@ int main(int argc, char **argv)
                     loglevel = RTE_LOG_EMERG;
                 else
                     rte_exit(EXIT_FAILURE, "Invalid value for loglevel: %s\n", optarg);
-            } else if (!strcmp("latency-record-prefix", long_opts[optidx].name)) {
-                assert(optarg != NULL);
+            } else if (!strcmp("latency-histogram", long_opts[optidx].name)) {
                 latency_record = true;
-                strncpy(latency_record_prefix, optarg, MAX_PATH);
             } else if (!strcmp("debug", long_opts[optidx].name)) {
                 debug = true;
             } else if (!strcmp("min-pkt-size", long_opts[optidx].name)) {
@@ -1256,7 +1269,7 @@ int main(int argc, char **argv)
     printf("using HPET in latency measurement!\n");
 #endif
     if (latency_record) {
-        printf("  recording histogram using prefix \"%s\"\n", latency_record_prefix);
+        printf("  recording histogram and publishing them via tcp://*:(54000 + cpu_idx)\n");
     }
     printf("loop count = %d\n", loop_count);
     printf("offered throughput = %.2f Gbps\n", offered_throughput);
@@ -1418,6 +1431,8 @@ int main(int argc, char **argv)
     int used_cores_per_node[PS_MAX_NODES];
     memset(used_cores_per_node, 0, sizeof(int) * PS_MAX_NODES);
 
+    void *zctx = zmq_ctx_new();
+
     unsigned my_cpu;
     RTE_LCORE_FOREACH(my_cpu) {
         int node_id = numa_node_of_cpu(my_cpu);
@@ -1438,6 +1453,9 @@ int main(int argc, char **argv)
 #else
             ctx->cycle_hz   = rte_get_tsc_hz();
 #endif
+
+        ctx->zctx = zctx;
+        assert(ctx->zctx != NULL);
 
         ctx->num_txq_per_port = num_txq_per_port[node_id];
         ctx->ring_idx   = used_cores_per_node[node_id];
@@ -1464,8 +1482,6 @@ int main(int argc, char **argv)
 
         ctx->latency_measure = latency_measure;
         ctx->latency_record  = latency_record;
-        ctx->latency_log     = NULL;  /* opened in send_packets() */
-        strncpy(ctx->latency_record_prefix, latency_record_prefix, MAX_PATH);
         ctx->magic_number    = my_cpu;
 
         used_cores_per_node[node_id] ++;
@@ -1495,6 +1511,7 @@ int main(int argc, char **argv)
 
     printf("----------\n");
     printf("%.2f seconds elapsed\n", (end - begin) / 1000000.0);
+    zmq_ctx_term(zctx);
     return 0;
 }
 

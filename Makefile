@@ -12,7 +12,7 @@ PSPGEN_RTE_LIBS += rte_persistent rte_hash
 endif
 
 CFLAGS = -std=gnu99 -march=native -Wall -O2 -g -I$(RTE_SDK)/$(RTE_TARGET)/include
-LDFLAGS = -L$(RTE_SDK)/$(RTE_TARGET)/lib -pthread -lrt -lnuma -Wl,--whole-archive -Wl,--start-group $(patsubst %,-l%,$(PSPGEN_RTE_LIBS)) -Wl,--end-group -Wl,--no-whole-archive -ldl
+LDFLAGS = -L$(RTE_SDK)/$(RTE_TARGET)/lib -pthread -lrt -lnuma -lzmq -Wl,--whole-archive -Wl,--start-group $(patsubst %,-l%,$(PSPGEN_RTE_LIBS)) -Wl,--end-group -Wl,--no-whole-archive -ldl
 
 .PHONY: clean
 
