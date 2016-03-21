@@ -101,8 +101,7 @@ struct pspgen_context {
     uint64_t cnt_latency;
 
     bool latency_measure;
-    bool latency_record;
-    char latency_record_prefix[MAX_PATH];
+    bool latency_histogram;
     int latency_offset;
     uint16_t magic_number;
 
@@ -348,6 +347,70 @@ void preprocess_pcap_file() {
     printf("File size: %zu, number of packet: %ld\n", pcap_filesize, pcap_num_pkts_total);
 }
 
+static uint16_t tx_cb_add_timestamp(uint8_t port, uint16_t queue,
+                                    struct rte_mbuf *pkts[], uint16_t nb_pkts,
+                                    void *arg)
+{
+    struct pspgen_context *ctx = (struct pspgen_context *) arg;
+    uint64_t timestamp;
+#ifdef RTE_LIBEAL_USE_HPET
+    timestamp = rte_get_hpet_cycles();
+#else
+    timestamp = rte_get_tsc_cycles();
+#endif
+    for (int j = 0; j < nb_pkts; j++) {
+        void *pkt_start = rte_pktmbuf_mtod(pkts[j], void *);
+        void *marker    = RTE_PTR_ADD(pkt_start, ctx->latency_offset);
+        void *ts        = RTE_PTR_ADD(marker, sizeof(uint16_t));
+        *((uint16_t *)marker) = ctx->magic_number;
+        *((uint64_t *)ts)     = timestamp;
+        // Update checksums.  To avoid duplicate calculation, we skip this in
+        // build_packet* functions when measuring latency.
+        if (ctx->ip_version == 4) {
+            struct ipv4_hdr *ipv4hdr = RTE_PTR_ADD(pkt_start, sizeof(struct ether_hdr));
+            struct udp_hdr *udphdr   = RTE_PTR_ADD(ipv4hdr, sizeof(struct ipv4_hdr));
+            udphdr->dgram_cksum = 0;
+            udphdr->dgram_cksum = rte_ipv4_udptcp_cksum(ipv4hdr, udphdr);
+        } else {
+            struct ipv6_hdr *ipv6hdr = RTE_PTR_ADD(pkt_start, sizeof(struct ether_hdr));
+            struct udp_hdr *udphdr   = RTE_PTR_ADD(ipv6hdr, sizeof(struct ipv6_hdr));
+            udphdr->dgram_cksum = 0;
+            udphdr->dgram_cksum = rte_ipv6_udptcp_cksum(ipv6hdr, udphdr);
+        }
+    }
+    return nb_pkts;
+}
+
+static uint16_t rx_cb_measure_latency(uint8_t port, uint16_t queue,
+                                      struct rte_mbuf *pkts[], uint16_t nb_pkts,
+                                      uint16_t max_pkts, void *arg)
+{
+    struct pspgen_context *ctx = (struct pspgen_context *) arg;
+    uint64_t timestamp;
+#ifdef RTE_LIBEAL_USE_HPET
+    timestamp = rte_get_hpet_cycles();
+#else
+    timestamp = rte_get_tsc_cycles();
+#endif
+    for (unsigned j = 0; j < nb_pkts; j++) {
+        void *pkt_start = rte_pktmbuf_mtod(pkts[j], void *);
+        void *marker    = RTE_PTR_ADD(pkt_start, ctx->latency_offset);
+        void *ts        = RTE_PTR_ADD(marker, sizeof(uint16_t));
+        if (*((uint16_t *)marker) == ctx->magic_number) {
+            uint64_t old_timestamp = *((uint64_t *)ts);
+            uint64_t latency       = timestamp - old_timestamp;
+            ctx->cnt_latency ++;
+            ctx->accum_latency += latency;
+            unsigned latency_us = (unsigned) (latency / (ctx->cycle_hz / 1e6f));
+            ctx->latency_buckets[RTE_MIN((unsigned) MAX_LATENCY, latency_us)]++;
+        }
+        ctx->rx_bytes[port] += rte_pktmbuf_pkt_len(pkts[j]);
+    }
+    ctx->rx_packets[port] += nb_pkts;
+    ctx->rx_batches[port] += 1;
+    return nb_pkts;
+}
+
 static void init_rate_limit(struct rate_limiter_state *r, uint64_t bps)
 {
     r->rate = bps;  /* bits/sec */
@@ -421,7 +484,7 @@ void update_stats(struct rte_timer *tim, void *arg)
         ctx->accum_latency = 0;
         ctx->cnt_latency = 0;
 
-        if (ctx->latency_record) {
+        if (ctx->latency_histogram) {
             // This "published" histogram data will be silently discarded
             // if there is no endpoint connected.
             char msgbuf[160000], *msgbufp;
@@ -482,7 +545,7 @@ static inline uint32_t myrand(uint64_t *seed)
     return (uint32_t)(*seed >> 32);
 }
 
-void build_packet(char *buf, int size, bool randomize, uint64_t *seed)
+void build_packet(char *buf, int size, bool randomize, uint64_t *seed, bool skip_cksum)
 {
     struct ether_hdr *eth;
     struct ipv4_hdr *ip;
@@ -536,10 +599,11 @@ void build_packet(char *buf, int size, bool randomize, uint64_t *seed)
     char *content = (char *)((char *)udp + sizeof(*udp));
     memset(content, 0xf0, size - sizeof(*eth) - sizeof(*ip) - sizeof(*udp));
     memset(content, 0xee, 1);  /* To indicate the beginning of packet content area. */
-    udp->dgram_cksum = rte_ipv4_udptcp_cksum(ip, udp);
+    if (!skip_cksum)
+        udp->dgram_cksum = rte_ipv4_udptcp_cksum(ip, udp);
 }
 
-void build_packet_v6(char *buf, int size, bool randomize, uint64_t *seed)
+void build_packet_v6(char *buf, int size, bool randomize, uint64_t *seed, bool skip_cksum)
 {
     struct ether_hdr *eth;
     struct ipv6_hdr *ip;
@@ -554,7 +618,7 @@ void build_packet_v6(char *buf, int size, bool randomize, uint64_t *seed)
 
     /* Build an IPv6 header. */
     ip = (struct ipv6_hdr *)(buf + sizeof(*eth));
-    
+
     /* 4 bits: version, 8 bits: traffic class, 20 bits: flow label. */
     ip->vtc_flow = rte_cpu_to_be_32(6 << 28);
     ip->payload_len = rte_cpu_to_be_16(size - sizeof(*eth) - sizeof(*ip)); /* The minimum is 10 bytes. */
@@ -588,7 +652,8 @@ void build_packet_v6(char *buf, int size, bool randomize, uint64_t *seed)
     char *content = (char *)((char *)udp + sizeof(*udp));
     memset(content, 0xf0, size - sizeof(*eth) - sizeof(*ip) - sizeof(*udp));
     memset(content, 0xee, 1);  /* To indicate the beginning of packet content area. */
-    udp->dgram_cksum = rte_ipv6_udptcp_cksum(ip, udp);
+    if (!skip_cksum)
+        udp->dgram_cksum = rte_ipv6_udptcp_cksum(ip, udp);
 }
 
 void build_packet_from_trace(char *buf, char* packet, int captured_size, int actual_size) {
@@ -659,9 +724,9 @@ int send_packets(void *arg)
     // filling the output chunk.
     for (int f = 0; f < ctx->num_flows; f++) {
         if (ctx->ip_version == 4)
-            build_packet(packet_src[f], ctx->packet_size, ctx->randomize_flows, &seed);
+            build_packet(packet_src[f], ctx->packet_size, ctx->randomize_flows, &seed, ctx->latency_measure);
         else if (ctx->ip_version == 6)
-            build_packet_v6(packet_src[f], ctx->packet_size, ctx->randomize_flows, &seed);
+            build_packet_v6(packet_src[f], ctx->packet_size, ctx->randomize_flows, &seed, ctx->latency_measure);
     }
 
     for (int port_idx = 0; port_idx < ctx->num_attached_ports; port_idx++) {
@@ -715,7 +780,7 @@ int send_packets(void *arg)
         }
     }
 
-    if (ctx->latency_measure && ctx->latency_record) {
+    if (ctx->latency_measure && ctx->latency_histogram) {
         ctx->zsock = zmq_socket(ctx->zctx, ZMQ_PUB);
         int port = 54000 + ctx->my_cpu;
         char addrbuf[32];
@@ -724,6 +789,10 @@ int send_packets(void *arg)
         if (ret != 0) {
             perror("zmq_bind");
             return -1;
+        }
+        for (int i = 0; i < ctx->num_attached_ports; i++) {
+            rte_eth_add_tx_callback(i, ctx->ring_idx, tx_cb_add_timestamp, ctx);
+            rte_eth_add_rx_callback(i, ctx->ring_idx, rx_cb_measure_latency, ctx);
         }
     }
 
@@ -776,9 +845,9 @@ int send_packets(void *arg)
 
                     if (ctx->num_flows == 0) {
                         if (ctx->ip_version == 4) {
-                            build_packet(buf, cur_pkt_size, ctx->randomize_flows, &seed);
+                            build_packet(buf, cur_pkt_size, ctx->randomize_flows, &seed, ctx->latency_measure);
                         } else {
-                            build_packet_v6(buf, cur_pkt_size, ctx->randomize_flows, &seed);
+                            build_packet_v6(buf, cur_pkt_size, ctx->randomize_flows, &seed, ctx->latency_measure);
                         }
                     } else {
                         rte_memcpy(buf, packet_src[(next_flow[port_idx] + j) % ctx->num_flows], cur_pkt_size);
@@ -792,36 +861,6 @@ int send_packets(void *arg)
                 struct ether_hdr *eth = (struct ether_hdr *) buf;
                 memcpy(&eth->d_addr, &neighbor_ethaddrs[port_idx], ETHER_ADDR_LEN);
                 memcpy(&eth->s_addr, &my_ethaddrs[port_idx], ETHER_ADDR_LEN);
-            }
-
-            if (ctx->latency_measure) {
-                uint64_t timestamp;
-                #ifdef RTE_LIBEAL_USE_HPET
-                    timestamp = rte_get_hpet_cycles();
-                #else
-                    timestamp = rte_get_tsc_cycles();
-                #endif
-
-                for (int j = 0; j < ctx->batch_size; j++) {
-                    char *ptr = rte_pktmbuf_mtod(pkts[j], char *) + ctx->latency_offset;
-                    *((uint16_t *)ptr) = ctx->magic_number;
-                    *((uint64_t *)(ptr + sizeof(uint64_t))) = timestamp;
-                    void* pkt_start = rte_pktmbuf_mtod(pkts[j], void *);
-                    if (ctx->ip_version == 4)
-                    {
-                        struct ipv4_hdr* ipv4hdr = RTE_PTR_ADD(pkt_start, sizeof(struct ether_hdr));
-                        struct udp_hdr* udphdr = RTE_PTR_ADD(ipv4hdr, sizeof(struct ipv4_hdr));
-                        udphdr->dgram_cksum = 0;
-                        udphdr->dgram_cksum = rte_ipv4_udptcp_cksum(ipv4hdr, udphdr);
-                    }
-                    else
-                    {
-                        struct ipv6_hdr* ipv6hdr = RTE_PTR_ADD(pkt_start, sizeof(struct ether_hdr));
-                        struct udp_hdr* udphdr = RTE_PTR_ADD(ipv6hdr, sizeof(struct ipv6_hdr));
-                        udphdr->dgram_cksum = 0;
-                        udphdr->dgram_cksum = rte_ipv6_udptcp_cksum(ipv6hdr, udphdr);
-                    }
-                }
             }
 
             unsigned sent_cnt = 0;
@@ -864,34 +903,10 @@ skip_tx_packets:
                 update_rate(&ctx->rate_limiters[port_idx], 0);
             }
             if (ctx->latency_measure) {
-                unsigned recv_cnt = rte_eth_rx_burst(port_idx, ctx->ring_idx, &pkts[0], ctx->batch_size);
-                uint64_t timestamp;
-#ifdef RTE_LIBEAL_USE_HPET
-                timestamp = rte_get_hpet_cycles();
-#else
-                timestamp = rte_get_tsc_cycles();
-#endif
-                
-                for (unsigned j = 0; j < recv_cnt; j++) {
-                    char *buf = rte_pktmbuf_mtod(pkts[j], char *) + ctx->latency_offset;
-#ifndef RTE_LIBEAL_USE_HPET
-                    if ( *(uint16_t *)buf == ctx->magic_number ) 
-#endif
-                    {
-                        uint64_t old_rdtsc = *(uint64_t *)(buf + sizeof(uint64_t));
-                        uint64_t latency = timestamp - old_rdtsc;
-                        ctx->cnt_latency ++;
-                        ctx->accum_latency += latency;
-                        unsigned latency_us = (unsigned) (latency / (ctx->cycle_hz / 1e6f));
-                        ctx->latency_buckets[RTE_MIN((unsigned) MAX_LATENCY, latency_us)]++;
-                    }
-
-                    ctx->rx_bytes[port_idx] += rte_pktmbuf_pkt_len(pkts[j]);
+                unsigned recv_cnt = rte_eth_rx_burst(port_idx, ctx->ring_idx,
+                                                     &pkts[0], ctx->batch_size);
+                for (unsigned j = 0; j < recv_cnt; j++)
                     rte_pktmbuf_free(pkts[j]);
-                }
-
-                ctx->rx_packets[port_idx] += recv_cnt;
-                ctx->rx_batches[port_idx] += 1;
             }
         } /* end of for(attached_ports) */
 
@@ -979,8 +994,8 @@ int main(int argc, char **argv)
     bool randomize_flows = true;
 
     bool latency_measure = false;
-    bool latency_record  = false;
-    //char latency_record_prefix[MAX_PATH] = {0,};
+    bool latency_histogram  = false;
+    //char latency_histogram_prefix[MAX_PATH] = {0,};
     double offered_throughput = -1.0f;
 
     char neighbor_conf_filename[MAX_PATH] = "neighbors.conf";
@@ -1066,7 +1081,7 @@ int main(int argc, char **argv)
                 else
                     rte_exit(EXIT_FAILURE, "Invalid value for loglevel: %s\n", optarg);
             } else if (!strcmp("latency-histogram", long_opts[optidx].name)) {
-                latency_record = true;
+                latency_histogram = true;
             } else if (!strcmp("debug", long_opts[optidx].name)) {
                 debug = true;
             } else if (!strcmp("min-pkt-size", long_opts[optidx].name)) {
@@ -1077,7 +1092,7 @@ int main(int argc, char **argv)
                 mode = PKTGEN;
                 strncpy(neighbor_conf_filename, optarg, MAX_PATH);
                 assert(strnlen(neighbor_conf_filename, MAX_PATH) > 0);
-            } 
+            }
             break;
         case 'h':
             print_usage(argv[1]);
@@ -1268,7 +1283,7 @@ int main(int argc, char **argv)
 #ifdef RTE_LIBEAL_USE_HPET
     printf("using HPET in latency measurement!\n");
 #endif
-    if (latency_record) {
+    if (latency_histogram) {
         printf("  recording histogram and publishing them via tcp://*:(54000 + cpu_idx)\n");
     }
     printf("loop count = %d\n", loop_count);
@@ -1447,11 +1462,11 @@ int main(int argc, char **argv)
         ctx->num_cpus = num_cpus;
         ctx->my_node  = node_id;
         ctx->my_cpu   = my_cpu;
-        
+
 #ifdef RTE_LIBEAL_USE_HPET
-            ctx->cycle_hz   = rte_get_hpet_hz();
+        ctx->cycle_hz   = rte_get_hpet_hz();
 #else
-            ctx->cycle_hz   = rte_get_tsc_hz();
+        ctx->cycle_hz   = rte_get_tsc_hz();
 #endif
 
         ctx->zctx = zctx;
@@ -1480,9 +1495,9 @@ int main(int argc, char **argv)
         ctx->time_limit      = time_limit;
         ctx->offered_throughput = offered_throughput;
 
-        ctx->latency_measure = latency_measure;
-        ctx->latency_record  = latency_record;
-        ctx->magic_number    = my_cpu;
+        ctx->latency_measure   = latency_measure;
+        ctx->latency_histogram = latency_histogram;
+        ctx->magic_number      = my_cpu;
 
         used_cores_per_node[node_id] ++;
     }
